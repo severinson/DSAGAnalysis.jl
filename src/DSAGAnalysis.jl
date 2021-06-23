@@ -1,11 +1,13 @@
 module DSAGAnalysis
 
-using LinearAlgebra
+using LinearAlgebra, SparseArrays
 using CSV, DataFrames, PyPlot
 using Random, StatsBase, Statistics, Distributions
 using DataStructures
+using HDF5, H5Sparse
 
 include("Stats.jl")
+include("LIBSVM.jl")
 
 ### utilities
 
