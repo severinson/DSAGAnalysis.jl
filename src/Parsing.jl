@@ -82,6 +82,25 @@ function compute_mse_pca!(mses, iterates, Xs; mseiterations=20, Xnorm=104444.370
     mses
 end
 
+function compute_mse_logreg!(mses, iterates, data; mseiterations)
+    if iszero(mseiterations)
+        return mses
+    end    
+    Xs, bs, λ = data
+    prob = LogRegProblem(Xs, bs, λ)
+    niterations = length(mses)
+    is = unique(round.(Int, exp.(range(log(1), log(niterations), length=mseiterations))))
+    for k in 1:length(is)
+        i = is[k]
+        if !ismissing(mses[i])
+            continue
+        end
+        v = view(iterates, :, i)
+        mses[i] = loss(v, prob) + loss(v, regularizer(prob))
+    end
+    mses
+end
+
 """
 
 Read the sparse matrix stored in dataset with `name` in `filename` and partitions it column-wise 
@@ -129,7 +148,7 @@ must be provided as a vector `Xs`, corresponding to a horizontal partitioning of
 i.e., `X = hcat(Xs, ...)`. Explained variance is computed for of up to `mseiterations` different 
 iterations.
 """
-function df_from_output_file(filename::AbstractString, Xs::Union{Nothing, Vector{<:AbstractMatrix}}; df_filename::AbstractString=replace(filename, ".h5"=>".csv"), mseiterations=0, reparse=false)
+function df_from_output_file(filename::AbstractString; prob=nothing, df_filename::AbstractString=replace(filename, ".h5"=>".csv"), mseiterations=0, reparse=false)
     if !reparse && isfile(df_filename)
         return DataFrame(CSV.File(df_filename))
     end
@@ -140,11 +159,22 @@ function df_from_output_file(filename::AbstractString, Xs::Union{Nothing, Vector
     h5open(filename) do fid
         df = isfile(df_filename) ? DataFrame(CSV.File(df_filename)) : df_from_fid(fid)
         df = df[.!ismissing.(df.iteration), :]
-        if "iterates" in keys(fid) && mseiterations > 0
-            sort!(df, :iteration)
+        sort!(df, :iteration)        
+        if size(df, 1) == 0
+            return df
+        end
+        if "iterates" in keys(fid) && mseiterations > 0 && !isnothing(prob)
             mses = Vector{Union{Float64,Missing}}(df.mse)
-            select!(df, Not(:mse))
-            df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], Xs; mseiterations)
+            algo = df.algorithm[1]
+            if algo == "pca.jl"
+                select!(df, Not(:mse))                
+                df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], prob; mseiterations)
+            elseif algo == "logreg.jl"
+                Xs, bs = prob
+                λ = df.lambda[1]
+                select!(df, Not(:mse))
+                df.mse = compute_mse_logreg!(mses, fid["iterates"][:, :], (Xs, bs, λ); mseiterations)
+            end
         end
         CSV.write(df_filename, df)
         return df
@@ -203,11 +233,21 @@ function clean_df(df::DataFrame)
     df
 end
 
+function parse_output_file(filename::AbstractString; reparse=false, prob=nothing, mseiterations=20)
+    try
+        return df_from_output_file(filename; prob, mseiterations, reparse)
+    catch e
+        printstyled(stderr,"ERROR: ", bold=true, color=:red)
+        printstyled(stderr,sprint(showerror,e), color=:light_red)
+        println(stderr)
+    end    
+end
+
 """
 
 Read all output files from `dir` and write summary statistics (e.g., iteration time and convergence) to DataFrames.
 """
-function parse_pca_files(;dir::AbstractString, prefix="output", dfname="df.csv", reparse=false, Xs=nothing, mseiterations=20)
+function parse_output_files(dir::AbstractString; prefix="output", dfname="df.csv", reparse=false, prob=nothing, mseiterations=20)
 
     # process output files
     filenames = glob("$(prefix)*.h5", dir)
@@ -215,15 +255,16 @@ function parse_pca_files(;dir::AbstractString, prefix="output", dfname="df.csv",
     for (i, filename) in enumerate(filenames)
         t = now()
         println("[$i / $(length(filenames)), $(Dates.format(now(), "HH:MM"))] parsing $filename")
-        try
-            df_from_output_file(filename, Xs; mseiterations, reparse)
-        catch e
-            printstyled(stderr,"ERROR: ", bold=true, color=:red)
-            printstyled(stderr,sprint(showerror,e), color=:light_red)
-            println(stderr)            
-        end
+        parse_output_file(filename; reparse, prob, mseiterations)
         GC.gc()
     end
-    GC.gc()
     aggregate_dataframes(dir; prefix, dfname)
+end
+
+function parse_loop(args...; kwargs...)
+    while true
+        parse_output_files(args...; kwargs...)
+        sleep(60)
+    end
+    return
 end

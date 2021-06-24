@@ -125,7 +125,7 @@ And introduces:
 
 ```julia
 # AWS, 1000 genomes
-using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); notes="AWS, 1000genomes";
+using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); notes="AWS, 1000genomes";
 
 # AWS, 1000 genomes v2 (w. sep. computational latency)
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1_v2.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); notes="AWS, 1000genomes v2";
@@ -148,6 +148,9 @@ using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrame
 # Azure, 1000 genomes
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\pca-1000genomes-azure.hpc.F2s_v2.csv")); strip_columns!(df); remove_initialization_latency!(df); fix_update_latency!(df); notes="Azure, 1000genomes";
 df = filter(:niterations => (x)->x==100, df);
+
+# eX3, log. reg. rcv1full
+using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\ex3 traces\\logreg-rcv1full-ex3-rome16q.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); notes="ex3, rcv1full";
 
 # initialization
 using Revise # optional, needed for changes made to the source code be reflected in the REPL
