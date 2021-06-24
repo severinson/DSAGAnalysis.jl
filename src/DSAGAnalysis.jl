@@ -21,7 +21,9 @@ uniformly spaced out over the two vectors.
 """
 function write_table(xs::AbstractVector, ys::AbstractVector, filename::AbstractString; prefix="./results", sep=" ", nsamples=min(100, length(xs)))
     length(xs) == length(ys) || throw(DimensionMismatch("xs has dimension $(length(xs)), but ys has dimension $(length(ys))"))
-    open(joinpath(prefix, filename), "w") do io
+    path = joinpath(prefix, filename)    
+    mkpath(dirname(path))
+    open(path, "w") do io
         for i in round.(Int, range(1, length(xs), length=nsamples))
             write(io, "$(xs[i])$(sep)$(ys[i])\n")
         end
@@ -82,7 +84,7 @@ end
 Remove columns not necessary for analysis (to save space).
 """
 function strip_columns!(df)
-    for column in ["iteratedataset", "saveiterates", "outputdataset", "inputdataset", "inputfile", "algorithm", "outputfile"]
+    for column in ["iteratedataset", "saveiterates", "outputdataset", "inputdataset", "inputfile", "outputfile"]
         if column in names(df)
             select!(df, Not(column))
         end
@@ -1365,14 +1367,28 @@ Plot the rate of convergence over time for DSAG, SAG, SGD, and coded computing. 
 `latency=empirical` to plot against empirical latency, or let `latency=c5xlarge` to plot against 
 latency computed by the model, fitted to traces recorded on `c5xlarge` instances.
 """
-function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latency="empirical", niidm=nothing)
+function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latency="empirical", niidm=nothing)
     df = filter(:nworkers => (x)->x==nworkers, df)
     df = filter(:nreplicas => (x)->x==1, df)
     df = filter(:mse => (x)->!ismissing(x), df)
     println("nworkers: $nworkers, opt: $opt")
 
     # parameters are recorded as a tuple (nwait, nsubpartitions, stepsize)
-    if nworkers == 36
+    if nworkers == 10
+        nwait = nworkers
+        params = [
+            (nwait, 1, 0.1),
+            (nwait, 2, 0.1),            
+            (nwait, 5, 0.1),                        
+            (nwait, 40, 0.1),            
+            (nwait, 80, 0.1),         
+            (nwait, 120, 0.1),         
+            (nwait, 160, 0.1),         
+            (nwait, 240, 0.1),
+            (nwait, 320, 0.1),            
+        ]        
+
+    elseif nworkers == 36
 
         # # varying npartitions
         # nwait = 3
@@ -1445,13 +1461,9 @@ function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latenc
         if nwait < nworkers # for nwait = nworkers, DSAG and SAG are the same
             dfj = dfj[dfj.nostale .== false, :]
         end
-
-        # return dfj
         # for simulations
-        nbytes = dfj.nbytes[1]
-        nflops = dfj.worker_flops[1]
-        # return nbytes, nflops
-        # update_latency = mean(dfj.update_latency)
+        # nbytes = dfj.nbytes[1]
+        # nflops = dfj.worker_flops[1]
 
         println("DSAG: $(length(unique(dfj.jobid))) jobs")
         if size(dfj, 1) > 0
@@ -1462,12 +1474,13 @@ function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latenc
                 # dfj.time .= predict_latency(nwait, mean(dfi.worker_flops), nworkers; type=latency) .* dfj.iteration
                 df_comm, df_comp = niidm
                 dfs = simulate_iterations(nbytes, nflops/upscale; niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nwait*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
-                ys = opt .- dfj.mse
+                # ys = dfj.mse .- opt
                 dfj.time .= dfs.time[dfj.iteration]
                 println("Plotting DSAG with model latency for $latency")
             end
             xs = dfj.time
-            ys = opt.-dfj.mse
+            # ys = opt.-dfj.mse
+            ys = dfj.mse .- opt
             plt.semilogy(xs, ys, ".-", label="DSAG w=$nwait, p=$nsubpartitions")
             filename = "dsag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
             write_table(xs, ys, filename)
@@ -1493,6 +1506,30 @@ function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latenc
             write_table(xs, ys, filename)
         end
 
+        ### SAG        
+        dfj = dfi
+        dfj = dfj[dfj.variancereduced .== true, :]
+        dfj = dfj[dfj.nostale .== true, :]
+        println("SAG: $(length(unique(dfj.jobid))) jobs")
+        if size(dfj, 1) > 0
+            dfj = combine(groupby(dfj, :iteration), :mse => mean => :mse, :time => mean => :time)
+            if latency == "empirical"
+                println("Plotting SAG with empirical latency")
+            else
+                # TODO: not checked
+                # df_comm, df_comp = niidm
+                # dfs = simulate_iterations(nbytes, nflops/upscale; niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nwait*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
+                # ys = opt .- dfj.mse
+                # dfj.time .= dfs.time[dfj.iteration]
+                # println("Plotting DSAG with model latency for $latency")
+            end
+            xs = dfj.time
+            ys = opt.-dfj.mse
+            plt.semilogy(xs, ys, ".-", label="SAG w=$nwait, p=$nsubpartitions")
+            filename = "sag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
+            write_table(xs, ys, filename)
+        end
+        println()
     end
 
     # Plot SAG
@@ -1507,7 +1544,7 @@ function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latenc
     dfi = dfi[dfi.nsubpartitions .== nsubpartitions, :]
     # dfi = dfi[dfi.nostale .== true, :]
     println("SAG p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
-    dfj = by(dfi, :iteration, :mse => mean => :mse, :time => mean => :time)
+    dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
     sort!(dfj, :iteration)    
     if latency == "empirical"
         println("Plotting SAG with empirical latency")
@@ -1540,7 +1577,7 @@ function plot_convergence(df, nworkers, opt=maximum(skipmissing(df.mse)); latenc
     dfi = dfi[dfi.variancereduced .== false, :]
     dfi = dfi[dfi.stepsize .== stepsize, :]
     println("SGD p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
-    dfj = by(dfi, :iteration, :mse => mean => :mse, :time => mean => :time)
+    dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
     sort!(dfj, :iteration)
     if latency == "empirical"
         println("Plotting SGD with empirical latency")
