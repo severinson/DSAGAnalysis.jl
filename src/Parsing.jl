@@ -109,6 +109,14 @@ function worker_flops_from_df_pca(df; density=0.05360388070027386)
 end
 
 """
+
+The density of the rcv1full dataset is `0.0015492979884363385`.
+"""
+function worker_flops_from_df_logreg(df; density=0.0015492979884363385)
+    2density .* df.nrows .* df.ncolumns ./ df.npartitions .* df.nreplicas
+end
+
+"""
     df_from_output_file(filename::AbstractString, Xs::Vector{<:AbstractMatrix}; df_filename::AbstractString=replace(filename, ".h5"=>".csv"), mseiterations=0, reparse=false)
 
 Parse the .h5 file `filename` (resulting from a run of the PCA kernel) into a DataFrame, which is 
@@ -154,8 +162,11 @@ function aggregate_dataframes(dir::AbstractString; prefix::AbstractString="outpu
     for (i, df) in enumerate(dfs)
         df[!, :jobid] .= i # store a unique ID for each file read
     end
+    for (filename, df) in zip(filenames, dfs)
+        df[!, :filename] .= filename # store the filename
+    end
     df = vcat(dfs..., cols=:union)
-    df = clean_pca_df(df)
+    df = clean_df(df)
     CSV.write(joinpath(dir, dfname), df)
     df
 end
@@ -164,18 +175,28 @@ end
 
 Cleanup
 """
-function clean_pca_df(df::DataFrame)
+function clean_df(df::DataFrame)
     df = df[.!ismissing.(df.nworkers), :]
     df = df[.!ismissing.(df.iteration), :]
     df[!, :nostale] .= Missings.replace(df.nostale, false)
     df[!, :kickstart] .= Missings.replace(df.kickstart, false)
     df = df[df.kickstart .== false, :]
     select!(df, Not(:kickstart)) # drop the kickstart column
-    df[!, :worker_flops] = worker_flops_from_df_pca(df)
     df.npartitions = df.nworkers .* df.nsubpartitions
     rename!(df, :t_compute => :latency)
     rename!(df, :t_update => :update_latency)
-    df[!, :nbytes] = df.nrows .* df.ncomponents .* 4 # Float32 entries => 4 bytes per entry
+        
+    algo = df.algorithm[1]
+    length(unique(df.algorithm)) == 1 || error("Mixing multiple algorithms within the same DataFrame is not allowed")
+    if algo == "pca.jl"
+        df[!, :worker_flops] = worker_flops_from_df_pca(df)    
+        df[!, :nbytes] = df.nrows .* df.ncomponents .* 4 # Float32 entries => 4 bytes per entry        
+    elseif algo == "logreg.jl"
+        df[!, :worker_flops] = worker_flops_from_df_logreg(df)
+        df[!, :nbytes] = (df.nrows .+ 1) .* 4 # Float32 entries => 4 bytes per entry
+    else
+        error("algorithm is $algo, but must be either of pca.jl or logreg.jl")
+    end
     sort!(df, [:jobid, :iteration])
     df.time = combine(groupby(df, :jobid), :latency => cumsum => :time).time # cumulative time since the start of the computation
     df.time .+= combine(groupby(df, :jobid), :update_latency => cumsum => :time).time
