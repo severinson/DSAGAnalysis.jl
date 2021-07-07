@@ -149,8 +149,11 @@ using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrame
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\pca-1000genomes-azure.hpc.F2s_v2.csv")); strip_columns!(df); remove_initialization_latency!(df); fix_update_latency!(df); notes="Azure, 1000genomes";
 df = filter(:niterations => (x)->x==100, df);
 
+# Azure, log. reg. rcv1full
+using Revise, DSAGAnalysis; const m = DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\logreg-rcv1full-azure.hpc.F2s_v2.csv")); DSAGAnalysis.fix_nwaitschedule!(df); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="Azure, rcv1full";
+
 # eX3, log. reg. rcv1full
-using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\ex3 traces\\logreg-rcv1full-ex3-rome16q.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); notes="ex3, rcv1full";
+using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\ex3 traces\\logreg-rcv1full-ex3-rome16q.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="ex3, rcv1full, zero";
 
 # initialization
 using Revise # optional, needed for changes made to the source code be reflected in the REPL
@@ -190,18 +193,18 @@ m.plot_worker_mean_var_distribution(dfg; nbytes, nflops)
 # plot order statistics latency for a particular job
 m.plot_orderstats(df, jobid)
 
+# compute prior distribution statistics
+df_comm, df_comp, df_total = m.prior_statistics_df(dfg)
+
 # plot prior order statistics
 nworkers = 72
-m.plot_prior_orderstats(df; nworkers, nflops, model=(df_comm, df_comp))
+m.plot_prior_orderstats(df; nworkers, nbytes, nflops, model=(df_comm, df_comp))
 
 # plot autocorrelation
 m.plot_autocorrelation(df; nbytes, nflops)
 
 # plot cross-correlation
 m.plot_worker_latency_cov_cdf(df; nbytes, nflops)
-
-# compute prior distribution statistics
-df_comm, df_comp, df_total = m.prior_statistics_df(dfg)
 
 # compute predicted and empirical latency
 m.plot_latency_vs_nworkers(;df_comm, df_comp, df)
