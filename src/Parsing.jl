@@ -1,4 +1,4 @@
-using HDF5, DataFrames, CSV, Glob, Dates, Random
+using HDF5, DataFrames, CSV, Glob, Dates, Random, LinearAlgebra, DSAG
 
 """
 
@@ -165,12 +165,18 @@ function df_from_output_file(filename::AbstractString; prob=nothing, df_filename
         end
         if "iterates" in keys(fid) && mseiterations > 0 && !isnothing(prob)
             mses = Vector{Union{Float64,Missing}}(df.mse)
+            if reparse
+                mses .= missing
+            end
             algo = df.algorithm[1]
             if algo == "pca.jl"
                 select!(df, Not(:mse))                
                 df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], prob; mseiterations)
             elseif algo == "logreg.jl"
                 Xs, bs = prob
+                if length(unique(df.lambda)) != 1
+                    error("λ must be unique within each DataFrame")
+                end
                 λ = df.lambda[1]
                 select!(df, Not(:mse))
                 df.mse = compute_mse_logreg!(mses, fid["iterates"][:, :], (Xs, bs, λ); mseiterations)
@@ -185,10 +191,13 @@ end
 
 Aggregate all DataFrames in `dir` into a single DataFrame.
 """
-function aggregate_dataframes(dir::AbstractString; prefix::AbstractString="output", dfname::AbstractString="df.csv")
+function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir, prefix::AbstractString="output", dfname::AbstractString="df.csv")
     filenames = glob("$(prefix)*.csv", dir)
     println("Aggregating $(length(filenames)) files")
     dfs = [DataFrame(CSV.File(filename)) for filename in filenames]
+    if length(dfs) == 0
+        return DataFrame()
+    end
     for (i, df) in enumerate(dfs)
         df[!, :jobid] .= i # store a unique ID for each file read
     end
@@ -197,8 +206,15 @@ function aggregate_dataframes(dir::AbstractString; prefix::AbstractString="outpu
     end
     df = vcat(dfs..., cols=:union)
     df = clean_df(df)
-    CSV.write(joinpath(dir, dfname), df)
+    CSV.write(joinpath(outputdir, dfname), df)
     df
+end
+
+function load_logreg_problem(filename="/home/albin/.julia/dev/DSAGAnalysis/rcv1/rcv1_shuffled.h5"; npartitions=Threads.nthreads(), name="X", labelname="b")
+    X, b = DSAG.load_dataset(filename; name, labelname)
+    Xs = partition(X, npartitions)
+    bs = partition(b, npartitions)
+    return Xs, bs
 end
 
 """
