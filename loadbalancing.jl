@@ -1,94 +1,11 @@
-using DSAGAnalysis
-using Random, StatsBase, Distributions
-using Evolutionary
-
-function of(nwait, ps, ds, zmin, hmin)
-    nworkers = length(ps)
-    df, Ls = simulate_iterations(;nwait, niterations=100, ds_comm=fill(nothing, nworkers), ds_comp=ds, update_latency=0)
-    θ = 1/nworkers
-    z = sum(Ls .* θ ./ ps)
-    if z < zmin
-        return Inf
-    end
-    h = minimum(Ls ./ ps)
-    if h < hmin
-        return Inf
-    end
-    mean(df.latency)
-end
-
 
 """
 
-Select the number of partitions to minimize the mean squared expected latency across all workers,
-while maintaining the size of the fraction of the dataset processed per iteration.
-
-* h: target size of the fraction of the dataset processed in each iteration
-* ps: current number of partitions per worker
-* θs: fraction of the dataset stored at each worker
-* ms_comp: expected compute latency of each worker
-* ms_comm: expected communication latency of each worker
-
+Return the expected fraction of the dataset processed per iteration. Here, `θs` is the fraction of 
+the dataset stored, `ps` is the number of partitions, and `Ls` is the probability of finishing 
+among the `nwait` fastest workers, for each worker.
 """
-function optimize_partitions(;h, ps, θs, ms_comp, ms_comm)
-    nworkers = length(θs)
-    
-    # estimate the underlying coefficients for each worker determining the mean and variance
-    cms = ms_comp ./ (θs ./ ps)
-
-    # System of equations based on the Lagrangian
-    A = zeros(nworkers+1, nworkers+1)
-    b = zeros(nworkers+1)
-    for i in 1:nworkers
-        A[i, i] = 2 .* (θs[i] .* cms[i]).^2
-    end
-    A[1:nworkers, end] .= -θs
-    b[1:nworkers] .= -2θs .* cms .* ms_comm 
-
-    # constraint
-    A[end, 1:nworkers] .= θs
-    b[end] = h
-
-    # solve the system of equations
-    x = A \ b
-    qs = x[1:nworkers]
-    1 ./ qs
-end
-
-"""
-
-Update all partitions, except the `j`-th, such that a fraction `h` of the dataset is processed in
-each iteration.
-"""
-function balance_partitions!(ps, j; h, θs)
-    num = h - θs[j]/ps[j]
-    den = 0.0
-    for i in 1:length(ps)
-        if i != j
-            den += θs[i] / ps[i]
-        end
-    end
-    c = num / den
-    for i in 1:length(ps)
-        if i != j
-            ps[i] /= c
-        end
-    end
-    ps
-end
-
-"""
-
-"""
-function compute_latency_distribution(cm, cv, θ, p)
-    m = cm * θ / p
-    v = cv * θ / p
-    DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, m, v)        
-end
-
-
-
-function fraction_processed(ps, θs, Ls)
+function fraction_processed(ps::AbstractVector, θs::AbstractVector, Ls::AbstractVector)
     rv = 0.0
     for i in 1:length(Ls)
         rv += Ls[i] * θs[i] / ps[i]
@@ -96,441 +13,77 @@ function fraction_processed(ps, θs, Ls)
     rv
 end
 
-function load_balance_workers!(ps, h; θs, ds_comm, cms_comp, cvs_comp, nwait, niterations=100)
+"""Helper function for running event-drive simulations"""
+function simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait, niterations=100, nsamples=10, update_latency=0)
+    ms_comp = cms_comp .* θs ./ ps
+    vs_comp = cvs_comp .* θs ./ ps
+    ds_comp = compute_latency_distribution.(ms_comp, vs_comp, θs, ps)
     nworkers = length(ps)
-
-    function loss(L::Real)
-        (L - nwait/nworkers)^2
+    latency = 0.0
+    Ls = zeros(nworkers)
+    for _ in 1:nsamples
+        dfi, Lsi = simulate_iterations(;nwait, niterations, ds_comm, ds_comp, update_latency)
+        latency += mean(dfi.latency)
+        Ls .+= Lsi        
     end
-
-    function loss(Ls::AbstractVector{<:Real})
-        rv = zero(eltype(Ls))
-        for L in Ls
-            rv += loss(L)
-        end
-        rv
-    end    
-
-    function select_worst(ps, Ls)
-        j = 0
-        v = 0
-        for (i, L) in enumerate(Ls)
-            l = loss(L)
-            if l > v
-                if (L > nwait/nworkers && ps[i] > 1) || (L < nwait/nworkers)
-                    j = i
-                    v = l
-                end
-           end
-        end
-        j
-    end
-
-    function constraint(h, ps, Ls)
-        fraction_processed(ps, θs, Ls) >= h
-    end
-
-    function satisfy_constraint!(ps, Ls)
-        while !constraint(h, ps, Ls)
-
-            # select the worker most likely to be among the nwait fastest for which the number of 
-            # partitions is at least 1
-            j = 0
-            v = 0.0
-            for (i, L) in enumerate(Ls)
-                if ps[i] > 1 && L > v
-                    j = i
-                    v = L
-                end
-            end
-
-            # decrease the number of partitions for this worker, thus increasing the fraction of
-            # the dataset processed per iteration
-            ps[j] -= 1
-            _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        end
-        ps
-    end
-
-    # Question: does it matter for which value of w I do this (other than nworkers)?
-
-
-    # load-balancing across workers
-    for _ in 1:niterations        
-        # _, Ls = simulate(ps)
-        _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        j = select_worst(ps, Ls)
-        if Ls[j] < nwait/nworkers
-            ps[j] += 1
-        else
-            ps[j] -= 1
-        end
-        # println("After update")
-        # println(Ls)
-        # println(ps)
-        # println(loss(Ls))
-        # println("$(fraction_processed(ps, Ls)) / $h")
-        # println()
-
-        satisfy_constraint!(ps, Ls)
-        # println("After constraint check")        
-        # println(Ls)
-        # println(ps)
-        # println(loss(Ls))
-        # println("$(fraction_processed(ps, Ls)) / $h")        
-        # println()
-    end
-
-    ps
+    latency /= nsamples
+    Ls ./= nsamples
+    latency, Ls
 end
 
-function load_balance_samples!(ps, h; θs, ds_comm, cms_comp, cvs_comp, nwait, niterations=200)
-    nworkers = length(ps)
+"""
 
-    function losses(ps, Ls)
-        vs = Ls .* θs ./ ps
-        (vs .- mean(vs)).^2
-    end
+Minimize the variance of the vector `Ls .* θs ./ ps` using a genetic optimization algorithm.
+"""
+function balance_contribution(ps0::AbstractVector{<:Real}, min_processed_fraction::Real; θs::AbstractVector{<:Real}, comp_means, comp_vars, comm_means, comm_vars, nwait::Integer, populationSize::Integer=100, tournamentSize::Integer=10, mutationRate::Real=1.0, time_limit::Real=10.0)
+    nworkers = length(ps0)
+    length(θs) == nworkers || throw(DimensionMismatch("θs has dimension $(length(θs)), but nworkers is $nworkers"))
+    length(comp_means) == nworkers || throw(DimensionMismatch("comp_means has dimension $(length(comp_means)), but nworkers is $nworkers"))
+    length(comp_vars) == nworkers || throw(DimensionMismatch("comp_vars has dimension $(length(comp_vars)), but nworkers is $nworkers"))
+    length(comm_means) == nworkers || throw(DimensionMismatch("comm_means has dimension $(length(comp_means)), but nworkers is $nworkers"))
+    length(comm_vars) == nworkers || throw(DimensionMismatch("comm_vars has dimension $(length(comp_vars)), but nworkers is $nworkers"))    
+    all((x)->0<x<=1, θs) || throw(ArgumentError("The entries of θs must be in (0, 1], but got $θs"))
+    all((x)->0<x, ps0) || throw(ArgumentError("The entries of ps must be positive, but got $ps0"))
 
-    function loss(ps, Ls)
-        var(Ls .* θs ./ ps)
-    end    
-
-    function select_worst(ps, Ls)
-        argmax(losses(ps, Ls))
-    end
-
-    function constraint(h, ps, Ls)
-        fraction_processed(ps, θs, Ls) >= h
-    end
-
-    function satisfy_constraint!(ps, Ls)
-        while !constraint(h, ps, Ls)
-
-            # select the worker most likely to be among the nwait fastest for which the number of 
-            # partitions is at least 1
-            j = 0
-            v = 0.0
-            for (i, L) in enumerate(Ls)
-                if ps[i] > 1 && L > v
-                    j = i
-                    v = L
-                end
-            end
-
-            # decrease the number of partitions for this worker, thus increasing the fraction of
-            # the dataset processed per iteration
-            ps[j] -= 1
-            _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        end
-        ps
-    end
-
-    function finite_differences(j, ps)
-        ps[j] += 1
-        _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        forward = loss(ps, Ls)
-        ps[j] -= 2
-        _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        backward = loss(ps, Ls)
-        ps[j] += 1
-        (forward - backward) / 2
-    end
-
-    # solve
-    _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-    best = loss(ps, Ls)
-    for _ in 1:niterations        
-        j = rand(1:nworkers)
-        p = ps[j]
-
-        ps[j] -= 1
-        _, Ls_new = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        new = loss(ps, Ls_new)
-        if rand() < 0.1 || (constraint(h, ps, Ls_new) && new < best)
-            p = ps[j]
-            best = new
-            Ls = Ls_new
-        end
-
-        ps[j] += 2
-        _, Ls_new = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-        new = loss(ps, Ls_new)
-        if rand() < 0.1 || (constraint(h, ps, Ls_new) && new < best)
-            p = ps[j]
-            best = new
-            Ls = Ls_new
-        end
-
-        ps[j] = p
-
-        # println("After update")
-        # println(Ls)
-        # println(ps)
-        # println(best)
-        # println("$(fraction_processed(ps, θs, Ls)) / $h")
-        # println()
-    end    
-
-    # # (old solver)
-    # for _ in 1:niterations        
-    #     _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
-    #     j = select_worst(ps, Ls)
-    #     δ = finite_differences(j, ps)
-    #     ps[j] -= sign(δ)
-    #     # println("After update")
-    #     # println(Ls)
-    #     # println(ps)
-    #     # println(loss(ps, Ls))
-    #     # println("$(fraction_processed(ps, θs, Ls)) / $h")
-    #     # println()
-
-    #     satisfy_constraint!(ps, Ls)
-    #     # println("After constraint check")        
-    #     # println(Ls)
-    #     # println(ps)
-    #     # println(loss(ps, Ls))
-    #     # println("$(fraction_processed(ps, θs, Ls)) / $h")        
-    #     # println()
-    # end
-
-    ps
-end
-
-function main(nworkers=10, nwait=5, nwait_max=8, hmin=0.01, c0=1e9, p0=10.0, b=100)
-
-    Random.seed!(123)
-
-    # iterative load-balancing
-    θs = fill(1/nworkers, nworkers)
-    ps = fill(p0, nworkers)
-    h = sum(θs ./ ps) * nwait / nworkers / 2
-    ps0 = ps    
-
-    # compute latency distribution
-    ms_comp = rand(LogNormal(1, 0.1), nworkers)
-    vs_comp = rand(LogNormal(0.1, 0.01), nworkers)
-    cms_comp = ms_comp ./ (θs ./ ps)#  ./ (c0 / 1e9)
-    cvs_comp = vs_comp ./ (θs ./ ps)#  ./ (c0 / 1e9)
-    ds_comp = DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, ms_comp, vs_comp)
-
-    # communication latency distribution
-    ms_comm = rand(LogNormal(1, 0.1), nworkers) ./ 100
-    vs_comm = rand(LogNormal(0.1, 0.01), nworkers) ./ 100
-    ds_comm = DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, ms_comm, vs_comm)    
-
-    println()
-    println("Uniform")
-    latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait, nsamples=100)
-
-    println("Probs.")    
-    println(ps)
-    println(Ls)    
-    println((latency, fraction_processed(ps, θs, Ls)))
-
-    println("Contribs.")
-    contribs = Ls .* θs ./ ps
-    println(contribs)    
-    println((mean(contribs), var(contribs)))
-
-    println("Latencies")
-    ms = cms_comp .* θs ./ ps .+ ms_comm    
-    println(ms)
-    println((mean(ms), var(ms)))
-
-    println()
-    println("Evolutionary contribution")
-    result = balance_contribution(copy(ps0), h; θs, ds_comm, cms_comp, cvs_comp, nwait)
-    ps = result.minimizer
-    latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait, nsamples=100)
-
-    println("Probs.")
-    println(ps)    
-    println(Ls)
-    println((latency, fraction_processed(ps, θs, Ls)))    
-
-    println("Contribs.")
-    contribs = Ls .* θs ./ ps
-    println(contribs)    
-    println((mean(contribs), var(contribs)))    
-
-    println("Latencies")
-    ms = cms_comp .* θs ./ ps .+ ms_comm
-    println(ms)
-    println((mean(ms), var(ms)))
-    
-    return    
-
-    println()
-    println("Lagrangian")    
-    ps = optimize_partitions(;h=h / (nwait / nworkers), ps, θs, ms_comp, ms_comm)
-    ps .= floor.(Int, ps)
-    ps .= max.(ps, 1)    
-    latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait)
-
-    println("Probs.")
-    println(ps)    
-    println(Ls)
-    println((latency, fraction_processed(ps, θs, Ls)))
-
-    println("Contribs.")
-    contribs = Ls .* θs ./ ps
-    println(contribs)    
-    println((mean(contribs), var(contribs)))    
-
-    println("Latencies")
-    ms = cms_comp .* θs ./ ps .+ ms_comm
-    println(ms)
-    println((mean(ms), var(ms)))
-
-    println()
-    println("Worker-balanced")
-    ps = load_balance_workers!(copy(ps0), h; θs, ds_comm, cms_comp, cvs_comp, nwait)
-    latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait)
-
-    println("Probs.")
-    println(ps)    
-    println(Ls)
-    println((latency, fraction_processed(ps, θs, Ls)))    
-
-    println("Contribs.")
-    contribs = Ls .* θs ./ ps
-    println(contribs)    
-    println((mean(contribs), var(contribs)))    
-
-    println("Latencies")
-    ms = cms_comp .* θs ./ ps .+ ms_comm
-    println(ms)
-    println((mean(ms), var(ms)))    
-
-    println()
-    println("Sample-balanced")    
-    ps = load_balance_samples!(copy(ps0), h; θs, ds_comm, cms_comp, cvs_comp, nwait)
-    latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait)
-
-    println("Probs.")
-    println(ps)    
-    println(Ls)
-    println((latency, fraction_processed(ps, θs, Ls)))    
-
-    println("Contribs.")
-    contribs = Ls .* θs ./ ps
-    println(contribs)    
-    println((mean(contribs), var(contribs)))    
-
-    println("Latencies")
-    ms = cms_comp .* θs ./ ps .+ ms_comm
-    println(ms)
-    println((mean(ms), var(ms)))
-
-    # latency, Ls = simulate(;θs, ps=ps, cms_comp, cvs_comp, ds_comm, nwait)
-    # println("Event-driven")
-    # println(ps)        
-    # println((latency, Ls, fraction_processed(ps, θs, Ls)))    
-
-    return
-
-    # balancing real-valued partitions
-    θs = fill(1/nworkers, nworkers)        
-    ps = fill(p0, nworkers)
-    h = sum(θs ./ ps)
-    j = 1
-    ps[j] *= 10
-    println("h: $h")
-    balance_partitions!(ps, j; h, θs)
-    h = sum(θs ./ ps)    
-    println("h: $h")
-    
-    return ps
-
-    # Random.seed!(123)
-
-    # compute latency distribution
-    cms_comp = rand(nworkers) ./ 1e9
-    cvs_comp = rand(nworkers) ./ 1e9
-
-    # communication latency distribution
-    cms_comm = rand(nworkers) ./ 1e9
-    cvs_comm = rand(nworkers) ./ 1e9    
-    
-    # fraction of dataset stored on each worker and current number of partitions
-    θs = fill(1/nworkers, nworkers)        
-    ps0 = fill(p0, nworkers) # uniform partitioning
-
-    # target size of the fraction of the dataset to process per iteration
-    ztarget = sum(θs ./ p0)
-
-    # compute latency mean and variance
-    ms_comp = cms_comp .* c0 .* θs ./ ps0
-    vs_comp = cvs_comp .* c0 .* θs ./ ps0
-
-    # communication latency mean and variance
-    ms_comm = cms_comm .* b
-    vs_comm = cvs_comm .* b
-
-    ps = optimize_partitions(;ztarget, ps0, θs, c0, ms_comp, ms_comm)
-
-    ms_comp_new = cms_comp .* c0 .* θs ./ ps
-    vs_comp_new = cvs_comp .* c0 .* θs ./ ps
-
-    # println(θs ./ ps0)
-    # println(θs .* qs)
-    println("ztarget: $ztarget, z: $(sum(θs ./ ps))")
-    old_loss = sum((ms_comp .+ ms_comm).^2)
-    new_loss = sum((ms_comp_new .+ ms_comm).^2)
-    println("Old loss: $old_loss, new loss: $new_loss")
-    println("Old:")
-    println(ms_comp)
-    println("New:")
-    println(ms_comp_new)
-
-
-    ds_comp = DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, ms_comp, vs_comp)    
-    ds_comm = DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, ms_comm, vs_comm)
-    df, Ls = simulate_iterations(;nwait, niterations=100, ds_comm, ds_comp, update_latency=0)
-    println("Ls (old):\t$Ls")
-
-    ds_comp = DSAGAnalysis.distribution_from_mean_variance.(ShiftedExponential, ms_comp_new, vs_comp_new)
-    df, Ls = simulate_iterations(;nwait, niterations=100, ds_comm, ds_comp, update_latency=0)    
-    println("Ls:\t\t$Ls")
-
-    return ps    
-
-    # Fascinating that the optimization approach I considered seems to make things worse
-    # Let's re-think. I want to load-balance, i.e., I want all Ls to have the correct value
-    # Let's address that using an iterative strategy, where I iteratively improve the worker furthest from its target
-end
-
-function evo_main()
+    # initialization
+    ds_comm = distribution_from_mean_variance.(Gamma, comm_means, comm_vars)
+    cms_comp = comp_means ./ (θs ./ ps)
+    cvs_comp = comp_vars ./ (θs ./ ps)
 
     # constraint
-    # (the sum of all elements must be >= 3)
-    g = x -> sum(x) - 4
+    # (the total expected conbtribution must be above some threshold)
+    function g(ps, Ls)
+        fraction_processed(ps, θs, Ls) - min_processed_fraction
+    end
+
+    # objective function
+    # (the variance of the contribution between workers)
     fworst = 0.0
-    function f(x)
-        c = g(x)
+    function f(ps)
+        _, Ls = simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait)
+        c = g(ps, Ls)
         if c < 0
             rv = fworst + abs(c)
-            println("not feasible: $rv")            
         else
-            rv = sum(x.^2)
-            println("feasible: $rv")
+            rv = var(Ls .* θs ./ ps)
             fworst = max(fworst, rv)
         end
         rv
     end
 
-    x0 = fill(2.0, 3)
-
-    populationSize = 100
-    selection = Evolutionary.tournament(10)
+    # evolutionary algorithm setup
+    nworkers = length(ps0)
+    selection = Evolutionary.tournament(tournamentSize)
     crossover = Evolutionary.LX()
-    lower = ones(3)
-    upper = fill(10, 3)
-    mutation = Evolutionary.PM(lower, upper)
+    lower = max.(ones(nworkers), ceil.(Int, ps0 ./ 2))
+    upper = 2 .* ps0
+    mutation = Evolutionary.domainrange((lower .- upper) ./ 10) # as recommended in the BGA paper
 
-    function int_mutation(x)
-        mutation(x)
+    # integer-output mutation that wraps another mutation
+    function integer_mutation(x)
+        if isone(mutationRate) || rand() < mutationRate
+            mutation(x)
+        end
         for i in 1:length(x)
             if rand() < 0.5
                 x[i] = floor(x[i])
@@ -541,8 +94,98 @@ function evo_main()
         x
     end
 
-    rv = Evolutionary.optimize(f, x0, Evolutionary.GA(;populationSize, selection, crossover, mutation=int_mutation))
+    # optimization algorithm
+    opt = Evolutionary.GA(;populationSize, mutationRate=1.0, selection, crossover, mutation=integer_mutation)
+    options = Evolutionary.Options(;time_limit, Evolutionary.default_options(opt)...)
+    Evolutionary.optimize(f, lower, upper, ps0, opt, options)
+end
 
-    println("fworst: $fworst")    
-    rv
+function load_balancer(chin::Channel; chout::Channel, ps0::AbstractVector, θs, min_processed_fraction::Real, nwait::Integer)
+    @info "load_balancer task started"
+    nworkers = length(ps0)
+    0 < nworkers || throw(ArgumentError("nworkers must be positive, but is $nworkers"))
+    length(θs) == nworkers || throw(DimensionMismatch("θs has dimension $(length(θs)), but nworkers is $nworkers"))
+    ps = Vector{Int}(ps0)        
+    comp_means = zeros(nworkers)
+    comp_vars = zeros(nworkers)
+    comm_means = zeros(nworkers)
+    comm_vars = zeros(nworkers)
+
+    function process_sample(v)
+        0 < v.worker <= nworkers || throw(ArgumentError("v.worker is $(v.worker), but nworkers is $nworkers"))
+        isnan(v.comp_mean) || comp_means[v.worker] = v.comp_mean
+        isnan(v.comp_var) || comp_vars[v.worker] = v.comp_var
+        isnan(v.comm_mean) || comm_means[v.worker] = v.comm_mean
+        isnan(v.comm_var) || comm_vars[v.worker] = v.comm_var
+        return
+    end
+
+    # helper to check if there is any missing latency data
+    all_populated = false    
+    function check_populated()
+        if all_populated
+            return all_populated
+        end        
+        all_populated = iszero(count(isnan, comp_means))
+        if all_populated
+            all_populated = all_populated && iszero(count(isnan, comp_vars))
+        end
+        if all_populated
+            all_populated = all_populated && iszero(count(isnan, comm_means))
+        end
+        if all_populated
+            all_populated = all_populated && iszero(count(isnan, comm_vars))
+        end
+        all_populated
+    end
+
+    while isopen(chin)
+
+        # consume all values currently in the channel
+        try
+            vin = take!(chin)
+            process_sample(vin)
+        catch e
+            if e isa InvalidStateException
+                break
+            else
+                rethrow()
+            end
+        end            
+        while isready(chin)
+            try
+                vin = take!(chin)
+                process_sample(vin)
+            catch e
+                if e isa InvalidStateException
+                    break
+                else
+                    rethrow()
+                end
+            end
+        end     
+    
+        # verify that we have complete latency information for all workers
+        if !check_populated()
+            continue
+        end
+
+        # run the load-balancer
+        new = load_balance()
+
+        # new = balance_contribution(ps, min_processed_fraction; θs, ds_comm, cms_comp, cvs_comp, nwait)
+        @info "started load-balancing optimization"
+        new = balance_contribution(ps, min_processed_fraction; θs, comp_means, comp_vars, comm_means, comm_vars, nwait)
+
+        # push any changes into the output channel
+        for i in 1:nworkers
+            if new[i] != ps[i]
+                vout = @NamedTuple{worker::Int,p::Int}(i, new[i])
+                push!(chout, vout)
+                ps[i] = new[i]
+            end
+        end
+    end
+    @info "load_balancer task finished"
+    return
 end
