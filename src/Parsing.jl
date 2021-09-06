@@ -48,6 +48,9 @@ function df_from_fid(fid, nrows=2504, ncolumns=81271767)
                 row["compute_latency_worker_$j"] = fid["benchmark/compute_latency"][j, i]
             end
         end
+        if "loadbalanced" in keys(fid["benchmark"])                                 
+            row["loadbalanced"] = fid["benchmark/loadbalanced"][i]
+        end
         push!(rv, row, cols=:union)
     end
     rv
