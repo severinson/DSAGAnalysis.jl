@@ -1,3 +1,5 @@
+using Distributions
+using Evolutionary
 
 """
 
@@ -15,9 +17,9 @@ end
 
 """Helper function for running event-drive simulations"""
 function simulate(;θs, ps, cms_comp, cvs_comp, ds_comm, nwait, niterations=100, nsamples=10, update_latency=0)
-    ms_comp = cms_comp .* θs ./ ps
-    vs_comp = cvs_comp .* θs ./ ps
-    ds_comp = compute_latency_distribution.(ms_comp, vs_comp, θs, ps)
+    comp_means = cms_comp .* θs ./ ps
+    comp_vars = cvs_comp .* θs ./ ps
+    ds_comp = DSAGAnalysis.distribution_from_mean_variance.(Gamma, comp_means, comp_vars)
     nworkers = length(ps)
     latency = 0.0
     Ls = zeros(nworkers)
@@ -46,9 +48,11 @@ function balance_contribution(ps0::AbstractVector{<:Real}, min_processed_fractio
     all((x)->0<x, ps0) || throw(ArgumentError("The entries of ps must be positive, but got $ps0"))
 
     # initialization
-    ds_comm = distribution_from_mean_variance.(Gamma, comm_means, comm_vars)
-    cms_comp = comp_means ./ (θs ./ ps)
-    cvs_comp = comp_vars ./ (θs ./ ps)
+    @info "comp" comp_means comp_vars    
+    @info "comm" comm_means comm_vars
+    ds_comm = DSAGAnalysis.distribution_from_mean_variance.(Gamma, comm_means, comm_vars)
+    cms_comp = comp_means ./ (θs ./ ps0)
+    cvs_comp = comp_vars ./ (θs ./ ps0)
 
     # constraint
     # (the total expected conbtribution must be above some threshold)
@@ -75,7 +79,7 @@ function balance_contribution(ps0::AbstractVector{<:Real}, min_processed_fractio
     nworkers = length(ps0)
     selection = Evolutionary.tournament(tournamentSize)
     crossover = Evolutionary.LX()
-    lower = max.(ones(nworkers), ceil.(Int, ps0 ./ 2))
+    lower = max.(ones(Int, nworkers), ceil.(Int, ps0 ./ 2))
     upper = 2 .* ps0
     mutation = Evolutionary.domainrange((lower .- upper) ./ 10) # as recommended in the BGA paper
 
@@ -97,7 +101,7 @@ function balance_contribution(ps0::AbstractVector{<:Real}, min_processed_fractio
     # optimization algorithm
     opt = Evolutionary.GA(;populationSize, mutationRate=1.0, selection, crossover, mutation=integer_mutation)
     options = Evolutionary.Options(;time_limit, Evolutionary.default_options(opt)...)
-    Evolutionary.optimize(f, lower, upper, ps0, opt, options)
+    Evolutionary.optimize(f, lower, upper, float.(ps0), opt, options)
 end
 
 function load_balancer(chin::Channel; chout::Channel, ps0::AbstractVector, θs, min_processed_fraction::Real, nwait::Integer)
@@ -105,18 +109,18 @@ function load_balancer(chin::Channel; chout::Channel, ps0::AbstractVector, θs, 
     nworkers = length(ps0)
     0 < nworkers || throw(ArgumentError("nworkers must be positive, but is $nworkers"))
     length(θs) == nworkers || throw(DimensionMismatch("θs has dimension $(length(θs)), but nworkers is $nworkers"))
-    ps = Vector{Int}(ps0)        
-    comp_means = zeros(nworkers)
-    comp_vars = zeros(nworkers)
-    comm_means = zeros(nworkers)
-    comm_vars = zeros(nworkers)
+    ps = Vector{Int}(ps0)
+    comp_means = fill(NaN, nworkers)
+    comp_vars = fill(NaN, nworkers)
+    comm_means = fill(NaN, nworkers)
+    comm_vars = fill(NaN, nworkers)
 
     function process_sample(v)
         0 < v.worker <= nworkers || throw(ArgumentError("v.worker is $(v.worker), but nworkers is $nworkers"))
-        isnan(v.comp_mean) || comp_means[v.worker] = v.comp_mean
-        isnan(v.comp_var) || comp_vars[v.worker] = v.comp_var
-        isnan(v.comm_mean) || comm_means[v.worker] = v.comm_mean
-        isnan(v.comm_var) || comm_vars[v.worker] = v.comm_var
+        isnan(v.comp_mean) || (comp_means[v.worker] = v.comp_mean)
+        isnan(v.comp_var) || (comp_vars[v.worker] = v.comp_var)
+        isnan(v.comm_mean) || (comm_means[v.worker] = v.comm_mean)
+        isnan(v.comm_var) || (comm_vars[v.worker] = v.comm_var)
         return
     end
 
@@ -170,17 +174,16 @@ function load_balancer(chin::Channel; chout::Channel, ps0::AbstractVector, θs, 
             continue
         end
 
-        # run the load-balancer
-        new = load_balance()
-
         # new = balance_contribution(ps, min_processed_fraction; θs, ds_comm, cms_comp, cvs_comp, nwait)
         @info "started load-balancing optimization"
-        new = balance_contribution(ps, min_processed_fraction; θs, comp_means, comp_vars, comm_means, comm_vars, nwait)
+        result = balance_contribution(ps, min_processed_fraction; θs, comp_means, comp_vars, comm_means, comm_vars, nwait)
+        new = result.minimizer
 
         # push any changes into the output channel
         for i in 1:nworkers
             if new[i] != ps[i]
-                vout = @NamedTuple{worker::Int,p::Int}(i, new[i])
+                vout = @NamedTuple{worker::Int,p::Int}((i, new[i]))
+                @info vout
                 push!(chout, vout)
                 ps[i] = new[i]
             end

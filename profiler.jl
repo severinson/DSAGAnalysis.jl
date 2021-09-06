@@ -113,7 +113,7 @@ function get_test_values(df)
     df.time, df.compute_latency_worker_4
 end
 
-function main(df, jobid=1, worker=4, nworkers=10)
+function main(df, jobid=17, worker=4, nworkers=10)
     
     df = filter(:jobid => (x)->x==jobid, df)
     sort!(df, :iteration)
@@ -132,7 +132,7 @@ function main(df, jobid=1, worker=4, nworkers=10)
     partitions_channel = Channel{@NamedTuple{worker::Int,p::Int}}(Inf)
     
     t1 = Threads.@spawn latency_profiler(latency_channel; chout=stats_channel, nworkers)
-    t2 = Threads.@spawn DSAGAnalysis.load_balancer(stats_channel; chout=partitions_channel, ps=ps, θs, min_processed_fraction, nwait)
+    t2 = Threads.@spawn load_balancer(stats_channel; chout=partitions_channel, ps0=ps, θs, min_processed_fraction, nwait)
     # t2 = Threads.@spawn process_stats(stats_channel)
 
     # while !istaskstarted(t1) || !istaskstarted(t2)
@@ -153,7 +153,7 @@ function main(df, jobid=1, worker=4, nworkers=10)
 
         while isready(partitions_channel)
             try
-                vin = take!(chin)
+                vin = take!(partitions_channel)
                 @info "ps[$(vin.worker)] = $(vin.p)"
                 ps[vin.worker] = vin.p
             catch e
@@ -163,9 +163,9 @@ function main(df, jobid=1, worker=4, nworkers=10)
                     rethrow()
                 end
             end
-        end          
+        end
 
-        # sleep(1e-6)
+        sleep(1e-6)
 
         # if i > 100
         #     break
