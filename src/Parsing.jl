@@ -1,4 +1,5 @@
-using HDF5, DataFrames, CSV, Glob, Dates, Random, LinearAlgebra
+using HDF5, H5Sparse, SparseArrays, DSAG
+using DataFrames, CSV, Glob, Dates, Random, LinearAlgebra
 
 """
 
@@ -85,6 +86,26 @@ function compute_mse_pca!(mses, iterates, Xs; mseiterations=20, Xnorm=104444.370
     mses
 end
 
+function compute_mse_pca!(mses, iterates, iterateindices, Xs; Xnorm=104444.37027911078)
+    size(iterates, 3) == length(iterateindices) || throw(DimensionMismatch("iterates has dimensions $(size(iterates)), but iterateindices has dimension $(length(iterateindices))"))
+    for k in 1:iterateindices
+        i = iterateindices[k]
+        if !ismissing(mses[i])
+            continue
+        end
+        norms = zeros(length(Xs))
+        t = @elapsed begin
+            Threads.@threads for j in 1:length(Xs)
+                norms[j] = norm(view(iterates, :, :, k)'*Xs[j])
+            end
+        end
+        mses[i] = (sum(norms) / Xnorm)^2
+        println("Iteration $i finished in $t s")
+    end
+    GC.gc()
+    mses
+end
+
 function compute_mse_logreg!(mses, iterates, data; mseiterations)
     if iszero(mseiterations)
         return mses
@@ -99,9 +120,77 @@ function compute_mse_logreg!(mses, iterates, data; mseiterations)
             continue
         end
         v = view(iterates, :, i)
-        mses[i] = loss(v, prob) + loss(v, regularizer(prob))
+        t = @elapsed begin
+            mses[i] = loss(v, prob) + loss(v, regularizer(prob))
+        end
+        @info "Computed MSE $(mses[i]) for iteration $i in $t seconds"
     end
     mses
+end
+
+function compute_mse_logreg!(mses, iterates, iterateindices, data)
+    size(iterates, 2) == length(iterateindices) || throw(DimensionMismatch("iterates has dimensions $(size(iterates)), but iterateindices has dimension $(length(iterateindices))"))
+    @info "Computing log. reg. MSE for iterations $iterateindices"
+    Xs, bs, λ = data
+    prob = LogRegProblem(Xs, bs, λ)
+    for k in 1:length(iterateindices)
+        i = iterateindices[k]
+        if !ismissing(mses[i])
+            continue
+        end        
+        v = view(iterates, :, k)
+        t = @elapsed begin
+            mses[i] = loss(v, prob) + loss(v, regularizer(prob))
+        end
+        @info "Computed MSE $(mses[i]) for iteration $i in $t seconds"        
+    end
+    mses
+end
+
+function compute_mse!(df, fid, prob; mseiterations, reparse)
+    mses = Vector{Union{Float64,Missing}}(df.mse)
+    if reparse
+        mses .= missing
+    end
+    algo = df.algorithm[1]    
+    if algo == "pca.jl"
+        select!(df, Not(:mse))
+        if "savediterateindices" in keys(fid)
+            iterateindices = fid["savediterateindices"][:]
+            df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], iterateindices, prob)            
+        else
+            df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], prob; mseiterations)
+        end        
+    elseif algo == "logreg.jl"
+        Xs, bs = prob
+        if length(unique(df.lambda)) != 1
+            error("λ must be unique within each DataFrame")
+        end
+        λ = df.lambda[1]
+        select!(df, Not(:mse))
+        if "savediterateindices" in keys(fid)
+            iterateindices = fid["savediterateindices"][:]
+            df.mse = compute_mse_logreg!(mses, fid["iterates"][:, :], iterateindices, (Xs, bs, λ))
+        else
+            df.mse = compute_mse_logreg!(mses, fid["iterates"][:, :], (Xs, bs, λ); mseiterations)
+        end
+    else
+        raise(ArgumentError("unknown algorithm $algo"))
+    end
+    df
+end
+
+"""
+    partition(n::Integer, p::Integer, i::Integer)
+
+Divide the integers from `1` to `n` into `p` evenly sized partitions, and return a `UnitRange` 
+making up the integers of the `i`-th partition.
+"""
+function partition(n::Integer, p::Integer, i::Integer)
+    0 < n || throw(ArgumentError("n must be positive, but is $n"))
+    0 < p <= n || throw(ArgumentError("p must be in [1, $n], but is $p"))    
+    0 < i <= p || throw(ArgumentError("i must be in [1, $p], but is $i"))
+    (div((i-1)*n, p)+1):div(i*n, p)
 end
 
 """
@@ -109,11 +198,10 @@ end
 Read the sparse matrix stored in dataset with `name` in `filename` and partitions it column-wise 
 into `nblocks` partitions.
 """
-function load_inputmatrix(filename::AbstractString, name::AbstractString="X"; nblocks=Threads.nthreads())
-    h5open(filename) do fid
-        m, n = h5size(fid, name)
-        return [h5readcsc(fid, name, floor(Int, (i-1)/nblocks*n+1), floor(Int, i/nblocks*n)) for i in 1:nblocks]
-    end
+function load_inputmatrix(filename, name::AbstractString="X"; nblocks=Threads.nthreads())
+    X = H5SparseMatrixCSC(filename, name)
+    m, n = size(X)
+    [sparse(X[:, partition(n, nblocks, i)]) for i in 1:nblocks]
 end
 
 """
@@ -167,23 +255,7 @@ function df_from_output_file(filename::AbstractString; prob=nothing, df_filename
             return df
         end
         if "iterates" in keys(fid) && mseiterations > 0 && !isnothing(prob)
-            mses = Vector{Union{Float64,Missing}}(df.mse)
-            if reparse
-                mses .= missing
-            end
-            algo = df.algorithm[1]
-            if algo == "pca.jl"
-                select!(df, Not(:mse))                
-                df.mse = compute_mse_pca!(mses, fid["iterates"][:, :, :], prob; mseiterations)
-            elseif algo == "logreg.jl"
-                Xs, bs = prob
-                if length(unique(df.lambda)) != 1
-                    error("λ must be unique within each DataFrame")
-                end
-                λ = df.lambda[1]
-                select!(df, Not(:mse))
-                df.mse = compute_mse_logreg!(mses, fid["iterates"][:, :], (Xs, bs, λ); mseiterations)
-            end
+            compute_mse!(df, fid, prob; mseiterations, reparse)
         end
         CSV.write(df_filename, df)
         return df
@@ -213,11 +285,14 @@ function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir
     df
 end
 
-function load_logreg_problem(filename="/home/albin/.julia/dev/DSAGAnalysis/rcv1/rcv1_shuffled.h5"; npartitions=Threads.nthreads(), name="X", labelname="b")
-    X, b = DSAG.load_dataset(filename; name, labelname)
-    Xs = partition(X, npartitions)
-    bs = partition(b, npartitions)
-    return Xs, bs
+function load_logreg_problem(filename="/home/albin/rcv1/rcv1_shuffled.h5"; nblocks=Threads.nthreads(), name="X", labelname="b")
+    h5open(filename) do fid
+        X = H5SparseMatrixCSC(fid, name)
+        m, n = size(X)
+        Xs = [sparse(X[:, partition(n, nblocks, i)]) for i in 1:nblocks]
+        bs = [fid[labelname][partition(n, nblocks, i)] for i in 1:nblocks]
+        return Xs, bs
+    end
 end
 
 """
@@ -283,6 +358,7 @@ end
 function parse_loop(args...; kwargs...)
     while true
         parse_output_files(args...; kwargs...)
+        println("Sleeping for 60s")
         sleep(60)
     end
     return
