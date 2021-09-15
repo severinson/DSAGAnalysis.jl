@@ -1,5 +1,6 @@
 using HDF5, H5Sparse, SparseArrays, DSAG
 using DataFrames, CSV, Glob, Dates, Random, LinearAlgebra
+using DSAGAnalysis
 
 """
 
@@ -266,7 +267,7 @@ end
 
 Aggregate all DataFrames in `dir` into a single DataFrame.
 """
-function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir, prefix::AbstractString="output", dfname::AbstractString="df.csv")
+function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir, prefix::AbstractString="output", dfname::AbstractString="df.csv", onlymse::Bool=true)
     filenames = glob("$(prefix)*.csv", dir)
     println("Aggregating $(length(filenames)) files")
     dfs = [DataFrame(CSV.File(filename)) for filename in filenames]
@@ -281,6 +282,15 @@ function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir
     end
     df = vcat(dfs..., cols=:union)
     df = clean_df(df)
+
+    DSAGAnalysis.strip_columns!(df)
+    DSAGAnalysis.fix_update_latency!(df)
+    DSAGAnalysis.remove_initialization_latency!(df)
+    DSAGAnalysis.compute_cumulative_time!(df)
+    if onlymse
+        df = filter(:mse => !ismissing, df)
+    end
+
     CSV.write(joinpath(outputdir, dfname), df)
     df
 end
@@ -325,6 +335,31 @@ function clean_df(df::DataFrame)
     df.time = combine(groupby(df, :jobid), :latency => cumsum => :time).time # cumulative time since the start of the computation
     df.time .+= combine(groupby(df, :jobid), :update_latency => cumsum => :time).time
     df
+end
+
+function print_parameters(dir::AbstractString; prefix="output", labels=nothing)
+    filenames = glob("$(prefix)*.h5", dir)
+    for filename in filenames
+        if !HDF5.ishdf5(filename)
+            @info "Skipping $filename (not a HDF5 file)"
+            continue
+        end
+        h5open(filename) do fid
+            if "parameters" in keys(fid) && typeof(fid["parameters"]) <: HDF5.Group
+                g = fid["parameters"]
+                println("$filename")
+                if isnothing(labels)
+                    println([key => g[key][] for key in keys(g)])
+                else
+                    println([key => g[key][] for key in labels])
+                end
+                println() 
+            else
+                @info "Skipping $filename (parameters missing)"
+            end
+        end
+    end
+    return
 end
 
 function parse_output_file(filename::AbstractString; reparse=false, prob=nothing, mseiterations=20)
