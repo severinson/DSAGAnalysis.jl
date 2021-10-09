@@ -5,10 +5,61 @@ using CSV, DataFrames, PyPlot
 using Random, StatsBase, Statistics, Distributions
 using DataStructures
 using HDF5, H5Sparse
+using Polynomials
 
 include("Stats.jl")
 include("LIBSVM.jl")
 include("eventdriven.jl")
+
+# From looking at the traces, things actually look quite promising
+# The latency difference between workers goes down steadily
+# I might even have set it a bit convervatively, in the sense that I could prob. allow it to make larger changes
+# Say +/- 20%
+# Let's also have a look at the overal literation time
+# Overall iteration time goes down over time
+# There are some regressions though, where it sometimes makes things worse
+# Maybe due to an unlucky optimization outcome
+# For now, let's not worry about that
+# Instead, let's have a look at the rate of convergence with and without lb
+# The performance difference with and without lb is small
+# With LB is slightly faster, but also leads to worse convergence, since it makes the gradient stochastic
+# Question: does the initialized_fraction value go to 1?
+# It does not
+# Let's check without lb
+# Without LB, it reaches about 98% coverage in about 600 iterations
+# With LB, it never goes above about 70% coverage
+# I thought about exacly this problem before
+# Cycling over the partitions seems to largely solve the problem
+# I could improve the implementation if necessary, but let's have a look at the convergence with this implementation first
+# It may still be the case that the differences are too small for the load-balancer to make a difference though
+# I'd need to run across architectures
+# The load-balancer gives a tiny speedup
+
+# I know that the load-balancer reduces iteration latency and that it doesn't seem to hurt convergence much
+# (it hurts it a little bit, but I may be able to address that too)
+# However, things are too uniform on eX3 for me to see any benefits
+# I could address that by either moving to AWS, or by artificially making eX3 more diverse
+# Let's do the second for now
+# Let's have three worker be twice as slow
+
+# Q: Does the load-balancer do something reasonable?
+# A: Yes
+# Q: Does convergence look ok?
+# A: Load-balancing hurts convergence a bit, when the sub-optimality gap is about 1e-6
+# Q: Does the LB give any improvement when I artificially slow down some workers?
+# A: No. The iteration speed is almost unchanged. It seems that the LB isn't capable of speeding up the process.
+
+# I need to improve the performance of the LB. It's too unstable.
+# Let's first fix the communication between the profiler and the lb.
+# If I always send I risk overwhelming the LB. If I only send once its empty the LB will always use 10s old data.
+# Ideally I'd want preemption, so that new values push out old values.
+# There should at most be nworkers values in the channel.
+
+# If I want to plot the mean and variance of the number of bytes communicated, I need to aggregate data for many different experiments. 
+# Log. reg., PCA, artificial datasets.
+# I can do that by loading 1 dataset at a time, computing the per-worker stats, throwing away everything except the comm. stuff,
+# and finally merging all of these dataframes
+
 
 ### utilities
 
@@ -107,16 +158,23 @@ function remove_initialization_latency!(df)
     compute_latency_columns = ["compute_latency_worker_$i" for i in 1:maxworkers]
     for dfi in groupby(df, :jobid)
         nworkers = dfi.nworkers[1]
+        t = size(dfi, 1)
+        if "loadbalanced" in names(df)
+            v = findfirst(!iszero, dfi.loadbalanced)
+            if !isnothing(v)
+                t = v - 1
+            end
+        end
         for j in 1:nworkers
-            dfi[1, latency_columns[j]] = mean(dfi[2:end, latency_columns[j]])
+            dfi[1, latency_columns[j]] = mean(dfi[2:t, latency_columns[j]])
         end
         if compute_latency_columns[1] in names(df) && !ismissing(dfi[1, compute_latency_columns[1]])
             for j in 1:nworkers
-                dfi[1, compute_latency_columns[j]] = mean(dfi[2:end, compute_latency_columns[j]])
+                dfi[1, compute_latency_columns[j]] = mean(dfi[2:t, compute_latency_columns[j]])
             end
         end
-        dfi[1, :latency] = mean(dfi[2:end, :latency])
-        dfi[1:2, :update_latency] .= mean(dfi[3:end, :update_latency])
+        dfi[1, :latency] = mean(dfi[2:t, :latency])
+        dfi[1:2, :update_latency] .= mean(dfi[3:t, :update_latency])
     end
     df
 end
@@ -185,36 +243,132 @@ end
 
 """
 
+Find the transition point between regular operation and latency bursts.
+"""
+function find_corner(ys)
+    ys = sort(ys)
+    min_latency, max_latency = ys[1], ys[end]    
+    rv = 0.0
+    dmin = Inf
+    for i in 1:length(ys)
+        dx = (length(ys) - i) / length(ys)
+        dy = (ys[i] - min_latency) / (max_latency - min_latency)
+        d = sqrt(dx^2 + dy^2)
+        if d < dmin
+            rv = ys[i]
+            dmin = d
+        end
+    end
+    rv
+end
+
+"""
+
+Return a DataFrame with column `latency`, containing the latency of the `worker_index`-th worker 
+in job `jobid`, and boolean column `burst` indicating if the worker is currently experiencing a 
+latency burst.
+"""
+function burst_df(df, jobid, worker_index; bin_size=10, min_increase=1.05, joinbins=false)
+    df = filter(:jobid => (x)->x==jobid, df)
+    name = "compute_latency_worker_$worker_index"
+    samples = replace(df[:, name], missing=>0.0)
+    rv = DataFrame(:latency => samples, :time => df.time)
+    min_latency, max_latency = minimum(samples), maximum(samples)
+    mean_latency = mean(samples)
+    thr = find_corner(samples)
+    rv.bin = ceil.(Int, rv.time ./ bin_size)
+    dfi = combine(groupby(rv, :bin), :latency => mean => :latency, :time => mean => :time)
+    if max_latency < mean_latency * min_increase
+        dfi.burst = zeros(Bool, size(dfi, 1))
+    else
+        dfi.burst = dfi.latency .> thr
+    end
+    if joinbins
+        select!(dfi, Not(:latency))
+        select!(dfi, Not(:time))
+        return leftjoin(rv, dfi, on=:bin, matchmissing=:error)
+    else
+        return dfi
+    end
+end
+
+"""
+
 Plot the iteration latency of workers with indices in `worker_indices` of job `jobid`.
 """
-function plot_timeseries(df, jobid, worker_indices; separate=true, cumulative=false)
+function plot_timeseries(df, jobid, worker_indices; separate=true, cumulative=false, mark_bursts=false)
+    !cumulative || !mark_bursts || throw(ArgumentError("can't plot bursts with cumulative=true"))
     println("Plotting per-worker iteration latency for workers: $worker_indices of jobid: $jobid")
-    df = filter(:jobid => (x)->x==jobid, df)
+    df = filter(:jobid => (x)->x==jobid, df)    
+
+    println("nworkers: $(mean(df.nworkers)), nwait: $(mean(df.nwait))")
+    # nslow: $(mean(df.nslow)), slowprob: $(mean(df.slowprob))
+
     sort!(df, :iteration)
     plt.figure()
+    miny, maxy = Inf, -Inf
+    overall = zeros(size(df, 1))
     for worker in worker_indices
         xs = df.iteration
         if separate
             # compute
             ys = df[:, "compute_latency_worker_$worker"]
             ys = cumulative ? cumsum(ys) : ys
-            plt.plot(xs, ys, label="Worker $worker (comp.)")
-            # write_table(xs[1:100], ys[1:100], "timeseries_compute_$(jobid)_$(worker).csv")
+            vs = filter(!isnan, ys)
+            if length(vs) > 0
+                miny = min(miny, minimum(vs))
+                maxy = max(maxy, maximum(vs))
+            end
+            if mark_bursts
+                dfi = burst_df(df, jobid, worker)
+                select!(dfi, Not(:latency))
+                dfi = leftjoin(df, dfi, on=:bin, matchmissing=:error)
+                mask = Bool.(dfi.burst)
+                plt.plot(xs[mask], ys[mask], "k.")
+                plt.plot(xs[.!mask], ys[.!mask], label="Worker $worker (comp.)")
+            else
+                plt.plot(xs, ys, label="Worker $worker (comp.)")                
+            end
+            write_table(xs[4001:5000], ys[4001:5000], "timeseries_compute_$(jobid)_$(worker).csv", nsamples=1000)
 
             # communication
             ys = df[:, "latency_worker_$worker"] .- df[:, "compute_latency_worker_$worker"]
             ys = cumulative ? cumsum(ys) : ys
+            vs = filter(!isnan, ys)
+            if length(vs) > 0
+                miny = min(miny, minimum(vs))
+                maxy = max(maxy, maximum(vs))
+            end
             plt.plot(xs, ys, label="Worker $worker (comm.)")
             # write_table(xs[1:100], ys[1:100], "timeseries_communication_$(jobid)_$(worker).csv")
         else
             ys = df[:, "latency_worker_$worker"]
             ys = cumulative ? cumsum(ys) : ys
+            vs = filter(!isnan, ys)
+            if length(vs) > 0
+                miny = min(miny, minimum(vs))
+                maxy = max(maxy, maximum(vs))
+            end        
+            overall .= max.(overall, vs)                            
             plt.plot(xs, ys, label="Worker $worker (total)")
-            # write_table(xs[1:100], ys[1001:1100], "timeseries_$(jobid)_$(worker).csv", nsamples=600)            
+            # write_table(xs[1:150], ys[11:160], "timeseries_$(jobid)_$(worker).csv", nsamples=150)
         end
     end    
+
+    # plt.plot(1:size(df, 1), overall, "k-")
+    # write_table((1:size(df, 1))[1:150], overall[11:160], "timeseries_overall_$(jobid).csv", nsamples=150)
+
+    # if enabled, mark iterations with load-balancing
+    if "loadbalanced" in names(df)
+        Is = findall(isone, df.loadbalanced)
+        println("load-balanced in iterations $Is")        
+        for i in Is
+            plt.plot([i, i], [miny, maxy], "k-")
+        end
+    end    
+
     plt.grid()
-    plt.legend()
+    # plt.legend()
     plt.title("Job $jobid")
     plt.xlabel("Iteration")
     plt.ylabel("Per-worker iteration latency [s]")
@@ -236,10 +390,20 @@ function plot_timeseries(df, jobid; cumulative=false, withupdate=true)
     if withupdate
         ys .+= df.update_latency
     end
-    ys = cumulative ? cumsum(ys) : ys
+    ys = cumulative ? cumsum(ys) : ys    
     plt.figure()    
     plt.plot(xs, ys)
     # write_table(xs, ys, "cumulative_time_$(jobid).csv")
+
+    # if enabled, mark iterations with load-balancing
+    if "loadbalanced" in names(df)
+        Is = findall(isone, df.loadbalanced)
+        println("load-balanced in iterations $Is")        
+        miny, maxy = minimum(ys), maximum(ys)
+        for i in Is
+            plt.plot([i, i], [miny, maxy], "k-")
+        end
+    end       
 
     plt.grid()
     plt.legend()
@@ -250,13 +414,91 @@ function plot_timeseries(df, jobid; cumulative=false, withupdate=true)
     return
 end
 
+### Two-state Markov model
+
+"""
+
+Return the state transition matrix for job `jobid` and worker `worker_index`.
+"""
+function state_transition_matrix(df, jobid, worker_index)
+    df = burst_df(df, jobid, worker_index)
+    states = Bool.(df.burst)
+    rv = zeros(2, 2)
+    state = states[1]
+    for i in 2:length(states)
+        rv[Int(state) + 1, Int(states[i]) + 1] += 1
+        state = df.burst[i]
+    end
+    @views s1 = sum(rv[1, :])
+    if !iszero(s1)
+        @views rv[1, :] ./= sum(rv[1, :])
+    end
+    @views s2 = sum(rv[2, :])
+    if !iszero(s2)
+        @views rv[2, :] ./= sum(rv[2, :])
+    end
+    rv
+end
+
+"""
+
+Return the state transition matirx averaged over all workers.
+"""
+function state_transition_matrix(df, jobid)
+    df = filter(:jobid => (x)->x==jobid, df)
+    rv = zeros(2, 2)
+    nworkers = maximum(df.nworkers)
+    n = 0
+    for i in 1:nworkers
+        P = state_transition_matrix(df, jobid, i)
+        if (P[2, 1] + P[2, 2]) != 0
+            rv .+= P
+            n += 1
+        end
+    end
+    rv ./= n
+end
+
+function base_burst_mean_latency(df, jobid, worker_index)
+    df = burst_df(df, jobid, worker_index)
+    base_latency = 0.0
+    burst_latency = 0.0
+    for i in 1:size(df, 1)
+        if df.burst[i]
+            burst_latency += df.latency[i]
+        else
+            base_latency += df.latency[i]
+        end
+    end
+    nbursts = sum(df.burst)
+    base_latency /= size(df, 1) - nbursts
+    burst_latency /= nbursts
+    base_latency, burst_latency
+end
+
+function base_burst_mean_latency_increase(df, jobid)
+    df = filter(:jobid => (x)->x==jobid, df)
+    nworkers = maximum(df.nworkers)
+    n = 0
+    rv = 0.0
+    for i in 1:nworkers
+        base_latency, burst_latency = base_burst_mean_latency(df, jobid, i)
+        if !isnan(burst_latency)
+            @info "worker $i: $(burst_latency / base_latency)"
+            rv += burst_latency / base_latency
+            n += 1
+        end
+    end
+    rv / n
+end
+
 ### per-worker latency distribution
 
 """
 
 Plot the latency distribution of individual workers.
 """
-function plot_worker_latency_distribution(df, jobid, worker_indices=[1, 2]; dist=Gamma, prune=0.01)
+function plot_worker_latency_distribution(df, jobid, worker_indices=[1, 2]; dist=Gamma, prune=0.05)
     df = filter(:jobid => (x)->x==jobid, df)
     worker_flops = df.worker_flops[1]
     nbytes = df.nbytes[1]    
@@ -271,8 +513,9 @@ function plot_worker_latency_distribution(df, jobid, worker_indices=[1, 2]; dist
 
     # overall
     plt.subplot(3, 1, 1)
-    for i in worker_indices        
-        xs = sort(df[:, latency_columns[i]])
+    for i in worker_indices              
+        samples = float.(df[:, latency_columns[i]])
+        xs = sort(samples)
         ys = range(0, 1, length=length(xs))
         plt.plot(xs, ys, label="Worker $i")
         # write_table(xs, ys, "cdf_$(jobid)_$(i).csv")
@@ -307,7 +550,16 @@ function plot_worker_latency_distribution(df, jobid, worker_indices=[1, 2]; dist
     # computation
     plt.subplot(3, 1, 3)
     for i in worker_indices
-        xs = sort(df[:, compute_latency_columns[i]])
+
+        # only select samples outside of bursts
+        @info "1"
+        dfi = burst_df(df, jobid, i, joinbins=true)
+        @info "2"
+        samples = df[:, compute_latency_columns[i]]
+        mask = Bool.(dfi.burst)
+        samples = float.(samples[mask])
+
+        xs = sort(samples)
         ys = range(0, 1, length=length(xs))
         plt.plot(xs, ys, label="Worker $i")
         # write_table(xs, ys, "cdf_compute_$(jobid)_$(i).csv")
@@ -325,7 +577,132 @@ function plot_worker_latency_distribution(df, jobid, worker_indices=[1, 2]; dist
     return
 end
 
+"""
+
+Compute the mean and variance of the latency for each worker.
+"""
+function per_worker_statistics(df, jobid)
+    df = filter(:jobid => (x)->x==jobid, df)
+    if size(df, 1) == 0
+        println("no job with ID $jobid")
+        return
+    end
+    nworkers = df.nworkers[1]
+    nsubpartitions = df.nsubpartitions[1]
+    println("nworkers: $nworkers, nsubpartitions: $nsubpartitions")
+
+    latency_columns = ["latency_worker_$i" for i in 1:nworkers]
+    compute_latency_columns = ["compute_latency_worker_$i" for i in 1:nworkers]    
+
+    comp_ms = [mean(df[:, col]) for col in compute_latency_columns]
+    comp_vs = [var(df[:, col]) for col in compute_latency_columns]
+
+    comp_mcs = [mean(df[:, col] ./ ((1 / nworkers) ./ df.nsubpartitions)) for col in compute_latency_columns]
+    comp_vcs = [var(df[:, col]  ./ sqrt.((1 / nworkers) ./ df.nsubpartitions)) for col in compute_latency_columns]    
+
+    println("comp_mcs = $comp_mcs")
+    println("comp_vcs = $comp_vcs")
+
+    comm_ms = [mean(df[:, latency_columns[i]] .- df[:, compute_latency_columns[i]]) for i in 1:nworkers]
+    comm_vs = [var(df[:, latency_columns[i]] .- df[:, compute_latency_columns[i]]) for i in 1:nworkers]
+
+    println("comm_ms = $comm_ms")
+    println("comm_vs = $comm_vs")
+
+    return
+end
+
 ### distribution of the mean and variance of the per-worker latency
+
+"""
+
+pca-1000genomes-dense-equiv-c5.xlarge-eu-north-1.csv
+[30048]
+[0.0005688430066438187]
+[2.975438171605625e-8]
+
+latency-c5.xlarge-eu-north-1.csv
+[43508208, 60096]
+[4.178164252137641, 0.00040377245389770224]
+[0.3648310268706024, 2.6410875254830194e-8]
+
+combined
+[43508208, 60096, 30048]
+[4.178164252137641, 0.00040377245389770224, 0.0005688430066438187]
+[0.3648310268706024, 2.6410875254830194e-8, 2.975438171605625e-8]
+
+Plot the mean and variance of the computation latency vs. worker_flops.
+"""
+function per_worker_mean_var_scatter(dfg, minsamples=100)
+    dfi = combine(groupby(dfg, :nbytes), :comm_mean => mean => :mean, :comm_var => mean => :var, :comm_mean => length => :nsamples)
+    dfi = filter(:nsamples => (x)->minsamples<=x, dfi)
+    # row = Dict(:nbytes => 0.0, :comm_mean => 0.0, :comm_var => 0.0, :nsamples => 1)
+    # push!(dfi, row)
+    println(dfi.nbytes)
+    println(dfi.mean)
+    println(dfi.var)
+
+    nbytes = [43508208, 60096, 30048]
+    means = [4.178164252137641, 0.00040377245389770224, 0.0005688430066438187]
+    vars = [0.3648310268706024, 2.6410875254830194e-8, 2.975438171605625e-8]    
+
+    # mean
+    plt.figure()
+    plt.plot(dfg.nbytes, dfg.comm_mean, ".")
+    plt.plot(dfi.nbytes, dfi.mean, "o")
+    # p = Polynomials.fit(dfi.nbytes, dfi.mean, 2)
+    # @info "p: $p"
+    xs = 10.0.^range(log10(dfi.nbytes[1]), log10(maximum(dfi.nbytes)), length=100)
+    # ys = p.(xs)    
+    # plt.plot(xs, ys, "k-")
+
+    # fitted line through the origin
+    slope = mean(dfi.mean ./ dfi.nbytes)
+    @info "slope: $slope"
+    ys = xs .* slope
+    plt.plot(xs, ys, "k--")    
+
+    # temp.
+    plt.plot(nbytes, means, "s")
+
+    xs = 10.0.^range(log10(minimum(nbytes)), log10(maximum(nbytes)), length=100)
+    slope = mean(means[1:2] ./ nbytes[1:2])
+    ys = xs .* slope
+    plt.plot(xs, ys, "m--")    
+
+
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.grid()
+
+    write_table(dfg.nbytes, dfg.comm_mean, "comm_mean.csv")
+    write_table(dfi.nbytes, dfi.mean, "comm_mean_mean.csv")
+    write_table(xs, ys, "comm_mean_line.csv")
+
+    # variance
+    plt.figure()
+    plt.plot(dfg.nbytes, dfg.comm_var, ".")
+    plt.plot(dfi.nbytes, dfi.var, "o")
+    # p = Polynomials.fit(dfi.nbytes, dfi.var, 2)
+    # @info "p: $p"
+    # ys = p.(xs)
+    # plt.plot(xs, ys, "k-")
+
+    # fitted line through the origin    
+    slope = mean(dfi.var ./ dfi.nbytes)
+    @info "slope: $slope"
+    ys = xs .* slope
+    plt.plot(xs, ys, "k--")
+
+    plt.xscale("log")
+    plt.yscale("log")    
+
+    write_table(dfg.nbytes, dfg.comm_var, "comm_var.csv")
+    write_table(dfi.nbytes, dfi.var, "comm_var_mean.csv")
+    write_table(xs, ys, "comm_var_line.csv")    
+
+    plt.grid()
+end
 
 """
 
@@ -855,6 +1232,90 @@ function plot_worker_latency_cov_cdf(df; nflops, nbytes=30048, maxworkers=108, l
     return
 end
 
+# I want to bin rows by log of time
+# Let's say power of 10 for now
+# Let's start by creating a df with jobid, worker index and latency for each worker
+# Let's bin latency and compute the mean in each bin
+# Next, for each bin, compute the ratio for each subsequent bin
+# Code works (I think)
+# Next, let's make a plot!
+# Let's make things simpler and choose a particular workload
+
+"""
+
+Takes as its argument a string of the form `"latency_worker_i"` or `"compute_latency_worker_i`, and returns `i` as an integer.
+"""
+function index_from_latency_name(s::AbstractString)
+    i = findlast((x)->x=='_', s)
+    parse(Int, view(s, i+1:length(s)))
+end
+
+
+"""
+
+Return a df with columns worker_index, jobid, worker_latency, worker_compute_latency, worker_flops and nbytes, 
+where each row corresponds to a particular worker and job.
+"""
+function tall_from_wide(df)
+    df = filter([:nwait, :nworkers] => (x, y)->x==y, df)
+    maxworkers = maximum(df.nworkers)
+    latency_columns = ["latency_worker_$i" for i in 1:maxworkers]
+    compute_latency_columns = ["compute_latency_worker_$i" for i in 1:maxworkers]    
+    
+    # stack by latency
+    @time dftot = stack(df, latency_columns, [:jobid, :nbytes, :worker_flops, :iteration, :time], variable_name=:name, value_name=:latency)
+    # @time dftot.worker_index = [parse(Int, split(name, "_")[end]) for name in dftot.name]
+    @time dftot.worker_index = index_from_latency_name.(dftot.name)
+    @time select!(dftot, Not(:name))
+
+    # stack by compute latency
+    @time dfcomp = stack(df, compute_latency_columns, [:jobid], variable_name=:name, value_name=:comp_latency)
+    # @time dfcomm.worker_index = [parse(Int, split(name, "_")[end]) for name in dfcomm.name]
+    # @time dfcomp.worker_index = index_from_latency_name.(dfcomp.name)
+    # @time select!(dfcomp, Not(:name))
+
+    # join
+    # @time rv = innerjoin(dftot, dfcomm, on=[:jobid, :worker_index])
+    @time dftot.comp_latency = dfcomp.comp_latency
+
+    # add communication latency
+    @time dftot.comm_latency = dftot.latency .- dftot.comp_latency
+    dftot
+end
+
+"""
+
+Plot the 
+"""
+function plot_change_rate(dft, nlevels=20, maxchange=2, col=:latency)
+    dft = copy(dft)
+    dft.bin = max.(1, ceil.(Int, log10.(dft.time)))
+    rv = zeros(nlevels, maximum(dft.bin))
+    for dfi in groupby(dft, [:jobid, :worker_index])
+        dfj = combine(groupby(dfi, :bin), col => mean => :latency)
+        i = findfirst(isone, dfj.bin)
+        if ismissing(dfj.latency[i])
+            continue
+        end
+        for j in 1:size(dfj, 1)
+            if ismissing(dfj.latency[j])
+                continue
+            end
+            v = dfj.latency[j] / dfj.latency[i]            
+            x = dfj.bin[j]
+            y = round(Int, v / maxchange * nlevels)
+            y = min(nlevels, y)
+            y = max(1, y)
+            rv[y, x] += 1
+        end
+    end    
+    rv
+end
+
+# 0.9 - 1.1 => 5
+# 1.1 - 1.2 => 6
+# 0.8-0.9 => 4
+
 ### latency model code
 
 """
@@ -1322,16 +1783,122 @@ end
 
 ### convergence plots
 
-# function foo(dfj, v, p)
-#     # I want the time at which the prob. of the loss being less than v is equal to p
-#     # That means that 
-#     # Let's convert the loss to a boolean (at most v)
-#     # Next, take the average of that boolean 
+# Results aren't looking super fun
+# Clearly, reducing nwait gives an advantage
+# Let's add SAG back in
+# It doesn't seem like the load-balancer has time to make much of an improvement in these short-running jobs
+# The situation might be better for log. reg.
+# It's clear though that reducing nwait and using async results bring clear benefits
+# That's enough for us
+# I got what we need
+# Let's put in a few more experiments
 
-#     # Split time into bins
-#     # Convert the loss into a boolean (true if at most v)
-#     # Count the number of samples in each bin
-# end
+# I see now why the one with LB is faster already in the first iteration
+# It's because I set it equal to the mean over the remaining iterations
+# (to remove initialization latency)
+# I'd need to replace it with the mean over the iterations up until the first LB
+# I've fixed it
+
+# First, let's consider DSAG with w=9 under perfect conditions
+# That's the baseline for all scenarios
+# Next, let's consider the 4 different scenarios separately
+# For each scenario, plot the baseline together with DSAG for different parameters
+
+# nslow=0, slowprob=0
+# (loss 4e-3)
+# w=6, no LB
+# 164.468
+
+# w=9, LB
+# 167.225 
+
+# w=6, LB
+# 171.996
+
+# w=9, no LB
+# 172.657 
+
+# DSAG nwait=6, no LB is 5% faster than SAG
+# DSAG nwait=6, LB is about the same as SAG
+# DSAG nwait=9, LB is in between
+
+# nslow=3, slowprob=0
+# (loss 4e-3)
+# DSAG nwait=6, no LB is best, and is more than 2x faster than SAG and about the same speed as SAG under perfect conditions
+# DSAG nwait=6 and nwait=9, LB are similar, but nwait=6 is slightly faster
+
+# nslow=0, slowprob=0.1
+# (loss 4e-3)
+# DSAG nwait=9 with and without LB are the same
+# DSAG nwait=6, LB is almost twice as fast, but not quite as fast as SAG under ideal conditions
+# I'm missing data for DSAG=6, no LB
+
+# nslow=3, slowprob=0.1
+# DSAG nwait=9 with LB is 20-25% faster than without LB
+# I'm missing data for nwait=6
+
+# The conclusion is that reducing nwait gets you pretty much ideal performance
+# (the same as SAG under ideal conditions)
+# Using the LB actually reduces performance, since it slows down the fastest workers
+# That's an inherent feature of the LB
+# Although I could, of course, change the LB so that it only speeds up slow workers and never slows down fast workers
+# I need to think a bit about what do to now
+
+# GD, stepsize 128
+# Is = [0, 1, 5, 10, 20, 40, 50, 75, 100]
+# fs = [0.6931471805599444, 0.5757509367339131, 0.39244359279752594, 0.30707040115301165, 0.23614727589228687, 0.18346042017331302, 0.17000816720049297, 0.1491794304064495, 0.1368085331380532]
+# To reach 1e-4: > 1e6 iterations
+
+# GD, stepsize 256
+# Is = [0, 1, 5, 10, 15, 20]
+# fs = [0.6931471805599444, 0.4901311532575216, 0.30067788002418033, 0.2330460895591535, 0.20131232433266838, 0.1821599500258606]
+# To reach 1e-4: > 1e6 iterations
+
+# GD, stepsize 1000
+# Is = [0, 1, 5, 10, 15, 20]
+# fs = [0.6931471805599444, 0.2700252259844102, 0.19942048473537807, 0.14104499661819198, 0.12726369493098577, 0.11864164451048687]
+# To reach 1e-4: > 1e6 iterations
+
+# SAG, stepsize 1000, nwait 48, nsubpartitions 480
+Is = [0, 10, 50, 100, 150, 200]
+fs = [0.6931471805599444, 0.14787831085616412, 0.09752716859470263, 0.1382957363421898, 0.17973698135153582, 0.10014377415557275]
+
+Is = [0, 10, 50, 100, 200, 400, 500, 750, 1000]
+fs = [0.6931471805599444, 0.14787831085616412, 0.09752716859470263, 0.1382957363421898, 0.10014377415557275, 0.06931350121788657, 0.06915655450649712, 0.08117820654429656, 0.06649721139774649]
+
+# GD, stepsize 10000
+# Is = [0, 1, 5, 10, 15, 20]
+# fs = [0.6931471805599444, 0.527436814382326, 5.63786891630697, 0.5669757343704201, 0.3911818140869798, 0.28593461743066795]
+# To reach 1e-4: ≈ 1e4-2e4
+
+# SAG, stepsize 10000, nwait 48, nsubpartitions 480
+Is = [0, 10, 50, 100, 150, 200]
+fs = [0.6931471805599444, 0.6458971233161701, 0.13879046284147123, 0.07283336094723879, 0.08034888335618584, 0.1068566398225466]
+
+Is = [0, 10, 50, 100, 200, 400, 500, 750, 1000]
+fs = [0.6931471805599444, 0.6458971233161701, 0.13879046284147123, 0.07283336094723879, 0.1068566398225466, 0.2371697935004405, 0.44595219902308675, 0.12881074897148503, 0.14836394614832593]
+
+# GD, stepsize 100000
+# Is = [0, 1, 5, 10, 15, 20]
+# fs = [0.6931471805599444, Inf, Inf, 3.25800791386318, 5.1815523657650004, Inf]
+
+# ex3
+# SAG, stepsize 1000
+Is = [1, 2, 3, 6, 11, 21, 38, 70, 127, 234, 428, 785, 1438, 2637, 4833, 8859, 16238, 29764, 54556, 100000]
+fs = [0.26834265364438425, 0.20494044286187493, 0.18453340895954867, 0.15988284517293044, 0.14349297868733563, 0.11821682341158148, 0.10448101312138802, 0.08740593815032184, 0.20757379542066404, 0.08214655195785492, 0.06639599388187367, 0.060916167226869176, 0.0569138145867912, 0.05318697826946615, 0.04971212562850331, 0.046522679820757494, 0.04365483222663333, 0.041140123472714875, 0.039003760637618436, 0.037264706092371855]
+
+# SAG, stepsize 10000
+Is = [1, 2, 3, 6, 11, 21, 38, 70, 127, 234, 428, 785, 1438, 2637, 4833, 8859, 16238, 29764, 54556, 100000]
+fs = [0.5103203261292784, 0.6321112353472755, 0.6961155657885862, 0.7331210561255893, 0.6708938131228802, 0.44520704891691165, 0.3609102302713835, 0.9531964842847881, 1.8108350458978526, 0.8161233711215429, 0.41436585542672416, 0.7572459212147262, 0.4289757693465181, 0.2561249222133476, 0.15757529057239483, 0.3881388761550672, 0.13902790295164846, 0.32675605385829254, 0.7129304091954426, 0.135995569313817]
+
+# GD, stepsize 1000
+Is = [1, 2, 3, 4, 7, 11, 18, 30, 48, 78, 127, 207, 336, 546, 886, 1438, 2336, 3793, 6158, 10000]
+fs = [0.2700252172197113, 0.23782497262987526, 0.2248956483906497, 0.21636728546543718, 0.16223770018082442, 0.13697029505242303, 0.12086405537958705, 0.10675533663753153, 0.09599213762757994, 0.0868644357618402, 0.07943239547397388, 0.07337431752420415, 0.06838392380453197, 0.06411012376600528, 0.06037688133657744, 0.05702530071077946, 0.05394218440137071, 0.051072875818447556, 0.048396595452253194, 0.04591793314540445]
+
+# GD, stepsize 10000
+Is = [1, 2, 3, 4, 7, 11, 18, 30, 48, 78, 127, 207, 336, 546, 886, 1438, 2336, 3793, 6158, 10000]
+fs = [0.5274367019280838, 0.4408785035709458, 0.5596329650465613, 1.1475935182656603, 3.656783132128757, 0.5351843644819414, 0.37338246539680914, 0.2483774893875378, 0.1679318649604483, 0.11190084432865868, 0.07509226910333948, 0.135896635802303, 0.0675397604450637, 0.0727854747272732, 0.06000141017603729, 0.05712261035824127, 0.052868390352489004, 0.04922075927152398, 0.0497684082828835, 0.04278610479777781]
+
 
 """
 
@@ -1340,8 +1907,22 @@ Plot the rate of convergence over time for DSAG, SAG, SGD, and coded computing. 
 latency computed by the model, fitted to traces recorded on `c5xlarge` instances.
 
 rcv1full optimal value: 0.08294410910152755
+1000genomes optimal value from orig. paper: 15.512054259119793
+1000genomes optimal value, new value: 31.024077073103722
+(new results have doubled this for some reason)
+opt=maximum(skipmissing(df.mse))
 """
-function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latency="empirical", niidm=nothing)
+function plot_convergence(df, nworkers; latency="empirical", niidm=nothing, problem="logreg")
+
+    if problem == "pca"
+        opt = 31.024077073103722
+    elseif problem == "logreg"
+        # opt = 0.06005923024042461
+        opt = 0.0551529291802335 # from running 150k iterations DSAG on ex3
+    else
+        throw(ArgumentError("unknown problem $problem"))
+    end
+
     df = filter(:nworkers => (x)->x==nworkers, df)
     df = filter(:nreplicas => (x)->x==1, df)
     df = filter(:mse => (x)->!ismissing(x), df)
@@ -1349,8 +1930,21 @@ function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latenc
     sort!(df, :iteration)
     println("nworkers: $nworkers, opt: $opt")
 
+    # new results have doubled MSE (don't know why)
+    # df.mse ./= 2
+
     # parameters are recorded as a tuple (nwait, nsubpartitions, stepsize)
-    if nworkers == 10
+    if nworkers == 9
+        fields = [:loadbalance, :nwait, :nsubpartitions]
+        # fields = [:loadbalance]
+        # params = [
+        #     Dict(:loadbalance => 0),
+        #     Dict(:loadbalance => 1),
+        # ]
+        # df = filter(:nwait => (x)->x==9, df)
+        df = filter(:nslow => (x)->x==0, df)
+        df = filter(:slowprob => (x)->isapprox(x, 0), df)
+    elseif nworkers == 10
         
         # varying the number of partitions
         # stepsize = 10.0
@@ -1445,30 +2039,47 @@ function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latenc
         error("parameters not defined")
     end
 
-    # plt.figure()    
+    plt.figure()
+
+    # # SAG under perfect conditions, for reference
+    # # (no LB, nwait=9, nslow=0, slowprob=0)
+    # xs = [0.002162563732858219, 0.004304636732858219, 0.00869007473285822, 0.015257394732858219, 0.025858978732858216, 0.04950131373285822, 0.09277568073285823, 0.1742538417328582, 0.3243359467328582, 0.6074780027328582, 1.1375031297328582, 2.128916854732858, 3.993166807732858, 7.4785932177328585, 13.990621306732859, 26.186997719732858, 49.00659525673286, 91.86290187773285, 172.4671476587329, 324.3845599287329]
+    # ys = [0.6287531677140825, 0.6175114646002856, 0.5986965256036081, 0.5714278962370246, 0.5326905112979482, 0.47421787482018407, 0.651465161206237, 2.784070495530143, 2.8498913906390184, 0.24609564403589007, 0.7764069488137026, 0.0831465638913265, 0.060069574760826125, 0.04355215282425168, 0.03184692460389105, 0.022833444848513684, 0.015514747467353499, 0.00948885406394201, 0.004417340832438672, 9.637393611837408e-6]    
+    # plt.plot(xs, ys, "k-", label="SAG ref.")
 
     upscale = 1
 
-    for (nwait, nwaitschedule, nsubpartitions, stepsize) in params
-        
-        dfi = df
-        if nwaitschedule == 1
-            dfi = filter(:nwait => (x)->x==nwait, dfi)
+    for dfi in groupby(df, fields)
+        if size(dfi, 1) == 0
+            continue
         end
-        dfi = filter(:nwaitschedule => (x)->isapprox(x, nwaitschedule), dfi)        
-        dfi = filter(:nsubpartitions => (x)->x==nsubpartitions, dfi)
-        dfi = filter(:stepsize => (x)->isapprox(x, stepsize, rtol=1e-2), dfi)
-        println("nwait: $nwait, nwaitschedule: $nwaitschedule, nsubpartitions: $nsubpartitions, stepsize: $stepsize")
+
+        label = [field => mean(dfi[!, field]) for field in fields]
+        # for p in params
+        # for (nwait, nwaitschedule, nsubpartitions, stepsize) in params
+
+        # dfi = df
+        # for (k, v) in p
+        #     println("Filtering on $k ≈ $v")
+        #     dfi = filter(k => (x)->isapprox(x, v, rtol=1e-2), dfi)
+        # end
+        
+        # dfi = df
+        # if nwaitschedule == 1
+        #     dfi = filter(:nwait => (x)->x==nwait, dfi)
+        # end
+        # dfi = filter(:nwaitschedule => (x)->isapprox(x, nwaitschedule), dfi)        
+        # dfi = filter(:nsubpartitions => (x)->x==nsubpartitions, dfi)
+        # dfi = filter(:stepsize => (x)->isapprox(x, stepsize, rtol=1e-2), dfi)
+        # println("nwait: $nwait, nwaitschedule: $nwaitschedule, nsubpartitions: $nsubpartitions, stepsize: $stepsize")
 
         ### DSAG
         dfj = dfi
-        dfj = dfj[dfj.variancereduced .== true, :]
-        if nwait < nworkers # for nwait = nworkers, DSAG and SAG are the same
-            dfj = dfj[dfj.nostale .== false, :]
-        end
-        # for simulations
+        dfj = filter(:variancereduced => (x)->x, dfj)
+        dfj = filter(:nostale => (x)->!x, dfj)
 
         println("DSAG: $(length(unique(dfj.jobid))) jobs")
+        println(unique(dfj.jobid))
         # dfk = dfj
         # for dfj in groupby(dfk, :jobid)
         if size(dfj, 1) > 0
@@ -1486,42 +2097,45 @@ function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latenc
                 println("Plotting DSAG with model latency for $latency")
             end
             xs = dfj.time
-            # ys = opt.-dfj.mse
-            ys = dfj.mse .- opt
+            if problem == "pca"
+                ys = opt.-dfj.mse
+            elseif problem == "logreg"
+                ys = dfj.mse .- opt
+            end
+            # ys = dfj.mse .- opt
 
-            # xs = xs[2:end]
-            # ys = diff(ys)
+            # println("xs: $xs")
+            # println("ys: $ys")
 
-            plt.semilogy(xs, ys, "s--", label="DSAG w=$nwait, s: $nwaitschedule, p=$nsubpartitions")
-            filename = "dsag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
-            write_table(xs, ys, filename)
+            plt.semilogy(xs, ys, "s-", label="DSAG $label")
+            # filename = "dsag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
+            # write_table(xs, ys, filename)
         end
         println()
+
+        # # simulated latency (using the event-driven model)
+        # if !isnothing(niidm) && nwait == 1
+
+        #     # # latency predicted by the new non-iid model
+        #     # t_iter = predict_latency_niid(nbytes, nflops, nworkers; niidm)[nwait]
+        #     # # t_iter = predict_latency(Nw, worker_flops, nworkers)
+        #     # xs = (t_iter + 0.0022031946363636366) .* dfj.iteration
+        #     # ys = opt .- dfj.mse
+        #     # plt.plot(xs, ys, "k.")
+
+        #     df_comm, df_comp = niidm
+        #     dfs = simulate_iterations(nbytes, nflops; niterations=maximum(dfj.iteration), nworkers, nwait, df_comm, df_comp, update_latency=0.0022031946363636366)
+        #     ys = opt .- dfj.mse
+        #     xs = dfs.time[dfj.iteration]
+        #     plt.plot(xs, ys, "k.")
+        #     filename = "event_driven_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"
+        #     write_table(xs, ys, filename)
         # end
 
-        # simulated latency (using the event-driven model)
-        if !isnothing(niidm) && nwait == 1
-
-            # # latency predicted by the new non-iid model
-            # t_iter = predict_latency_niid(nbytes, nflops, nworkers; niidm)[nwait]
-            # # t_iter = predict_latency(Nw, worker_flops, nworkers)
-            # xs = (t_iter + 0.0022031946363636366) .* dfj.iteration
-            # ys = opt .- dfj.mse
-            # plt.plot(xs, ys, "k.")
-
-            df_comm, df_comp = niidm
-            dfs = simulate_iterations(nbytes, nflops; niterations=maximum(dfj.iteration), nworkers, nwait, df_comm, df_comp, update_latency=0.0022031946363636366)
-            ys = opt .- dfj.mse
-            xs = dfs.time[dfj.iteration]
-            plt.plot(xs, ys, "k.")
-            filename = "event_driven_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"
-            write_table(xs, ys, filename)
-        end
-
-        ### SAG        
+        ### SAG
         dfj = dfi
-        dfj = dfj[dfj.variancereduced .== true, :]
-        dfj = dfj[dfj.nostale .== true, :]
+        dfj = filter(:variancereduced => (x)->x, dfj)
+        dfj = filter(:nostale => (x)->x, dfj)        
         println("SAG: $(length(unique(dfj.jobid))) jobs")
         if size(dfj, 1) > 0
             dfj = combine(groupby(dfj, :iteration), :mse => mean => :mse, :time => mean => :time)
@@ -1536,78 +2150,110 @@ function plot_convergence(df, nworkers, opt=minimum(skipmissing(df.mse)); latenc
                 # println("Plotting DSAG with model latency for $latency")
             end
             xs = dfj.time
-            ys = opt.-dfj.mse
-            plt.semilogy(xs, ys, ".-", label="SAG w=$nwait, p=$nsubpartitions")
-            filename = "sag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
-            write_table(xs, ys, filename)
+            if problem == "pca"
+                ys = opt.-dfj.mse
+            elseif problem == "logreg"
+                ys = dfj.mse .- opt
+            end            
+            plt.semilogy(xs, ys, "o--", label="SAG $label")
+            # filename = "sag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
+            # write_table(xs, ys, filename)
         end
         println()
+
+        ### SGD
+        dfj = dfi
+        dfj = filter(:variancereduced => (x)->!x, dfj)
+        println("SGD: $(length(unique(dfj.jobid))) jobs")
+        if size(dfj, 1) > 0
+            dfj = combine(groupby(dfj, :iteration), :mse => mean => :mse, :time => mean => :time)
+            if latency == "empirical"
+                println("Plotting SGD with empirical latency")
+            else
+                # TODO: not checked
+                # df_comm, df_comp = niidm
+                # dfs = simulate_iterations(nbytes, nflops/upscale; niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nwait*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
+                # ys = opt .- dfj.mse
+                # dfj.time .= dfs.time[dfj.iteration]
+                # println("Plotting DSAG with model latency for $latency")
+            end
+            xs = dfj.time
+            if problem == "pca"
+                ys = opt.-dfj.mse
+            elseif problem == "logreg"
+                ys = dfj.mse .- opt
+            end                        
+            plt.semilogy(xs, ys, "^-.", label="SGD $label")
+            # filename = "sag_$(nworkers)_$(nwait)_$(nsubpartitions)_$(stepsize).csv"            
+            # write_table(xs, ys, filename)
+        end
+        println()        
     end
 
-    # Plot SAG
-    # for nsubpartitions in sort!(unique(df.nsubpartitions))
-    nsubpartitions = 160
-    # for nsubpartitions in [80, 120, 160, 240, 320]
-    stepsize = 0.9
-    dfi = df
-    dfi = dfi[dfi.nwait .== nworkers, :]
-    dfi = dfi[dfi.variancereduced .== true, :]
-    dfi = dfi[dfi.stepsize .== stepsize, :]    
-    dfi = dfi[dfi.nsubpartitions .== nsubpartitions, :]
-    # dfi = dfi[dfi.nostale .== true, :]
-    println("SAG p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
-    dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
-    sort!(dfj, :iteration)    
-    if size(dfj, 1) > 0
-        if latency == "empirical"
-            println("Plotting SAG with empirical latency")
-        else
-            df_comm, df_comp = niidm
-            nflops = mean(dfi.worker_flops)        
-            dfs = simulate_iterations(nbytes, nflops/upscale; balanced=true, nruns=50, niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nworkers*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
-            ys = opt .- dfj.mse
-            dfj.time .= dfs.time[dfj.iteration]
+    # # Plot SAG
+    # # for nsubpartitions in sort!(unique(df.nsubpartitions))
+    # nsubpartitions = 160
+    # # for nsubpartitions in [80, 120, 160, 240, 320]
+    # stepsize = 0.9
+    # dfi = df
+    # dfi = dfi[dfi.nwait .== nworkers, :]
+    # dfi = dfi[dfi.variancereduced .== true, :]
+    # dfi = dfi[dfi.stepsize .== stepsize, :]    
+    # dfi = dfi[dfi.nsubpartitions .== nsubpartitions, :]
+    # # dfi = dfi[dfi.nostale .== true, :]
+    # println("SAG p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
+    # dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
+    # sort!(dfj, :iteration)    
+    # if size(dfj, 1) > 0
+    #     if latency == "empirical"
+    #         println("Plotting SAG with empirical latency")
+    #     else
+    #         df_comm, df_comp = niidm
+    #         nflops = mean(dfi.worker_flops)        
+    #         dfs = simulate_iterations(nbytes, nflops/upscale; balanced=true, nruns=50, niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nworkers*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
+    #         ys = opt .- dfj.mse
+    #         dfj.time .= dfs.time[dfj.iteration]
     
-            println("Plotting SAG with model latency for $latency")
-        end        
-        xs = dfj.time
-        ys = opt.-dfj.mse
-        plt.semilogy(xs, ys, "o-", label="SAG p=$nsubpartitions")
-        filename = "sag_$(nworkers)_$(nsubpartitions)_$(stepsize).csv"
-        write_table(xs, ys, filename)        
-    end
+    #         println("Plotting SAG with model latency for $latency")
+    #     end        
+    #     xs = dfj.time
+    #     ys = opt.-dfj.mse
+    #     plt.semilogy(xs, ys, "o-", label="SAG p=$nsubpartitions")
+    #     filename = "sag_$(nworkers)_$(nsubpartitions)_$(stepsize).csv"
+    #     write_table(xs, ys, filename)        
+    # end
 
-    # Plot SGD
-    nsubpartitions = 160
-    stepsize = 0.9
-    dfi = df
-    dfi = dfi[dfi.nwait .== nworkers, :]
-    dfi = dfi[dfi.nsubpartitions .== nsubpartitions, :]
-    dfi = dfi[dfi.variancereduced .== false, :]
-    dfi = dfi[dfi.stepsize .== stepsize, :]
-    println("SGD p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
-    dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
-    sort!(dfj, :iteration)
-    if size(dfj, 1) > 0
-        if latency == "empirical"
-            println("Plotting SGD with empirical latency")
-        else
-            # dfj.time .= predict_latency(nworkers, mean(dfi.worker_flops), nworkers; type=latency) .* dfj.iteration
+    # # Plot SGD
+    # nsubpartitions = 160
+    # stepsize = 0.9
+    # dfi = df
+    # dfi = dfi[dfi.nwait .== nworkers, :]
+    # dfi = dfi[dfi.nsubpartitions .== nsubpartitions, :]
+    # dfi = dfi[dfi.variancereduced .== false, :]
+    # dfi = dfi[dfi.stepsize .== stepsize, :]
+    # println("SGD p: $nsubpartitions, $(length(unique(dfi.jobid))) jobs")
+    # dfj = combine(groupby(dfi, :iteration), :mse => mean => :mse, :time => mean => :time)
+    # sort!(dfj, :iteration)
+    # if size(dfj, 1) > 0
+    #     if latency == "empirical"
+    #         println("Plotting SGD with empirical latency")
+    #     else
+    #         # dfj.time .= predict_latency(nworkers, mean(dfi.worker_flops), nworkers; type=latency) .* dfj.iteration
     
-            df_comm, df_comp = niidm
-            nflops = mean(dfi.worker_flops)        
-            dfs = simulate_iterations(nbytes, nflops/upscale; niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nworkers*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
-            ys = opt .- dfj.mse
-            dfj.time .= dfs.time[dfj.iteration]
+    #         df_comm, df_comp = niidm
+    #         nflops = mean(dfi.worker_flops)        
+    #         dfs = simulate_iterations(nbytes, nflops/upscale; niterations=maximum(dfj.iteration), nworkers=nworkers*upscale, nwait=nworkers*upscale, df_comm, df_comp, update_latency=0.0022031946363636366)
+    #         ys = opt .- dfj.mse
+    #         dfj.time .= dfs.time[dfj.iteration]
     
-            println("Plotting SGD with model latency for $latency")
-        end            
-        xs = dfj.time
-        ys = opt.-dfj.mse
-        plt.semilogy(xs, ys, "c^-", label="SGD p=$nsubpartitions")
-        filename = "sgd_$(nworkers)_$(nsubpartitions)_$(stepsize).csv"
-        write_table(xs, ys, filename)        
-    end
+    #         println("Plotting SGD with model latency for $latency")
+    #     end            
+    #     xs = dfj.time
+    #     ys = opt.-dfj.mse
+    #     plt.semilogy(xs, ys, "c^-", label="SGD p=$nsubpartitions")
+    #     filename = "sgd_$(nworkers)_$(nsubpartitions)_$(stepsize).csv"
+    #     write_table(xs, ys, filename)        
+    # end
 
     # # Plot GD
     # stepsize = 1.0

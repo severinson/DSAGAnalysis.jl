@@ -125,16 +125,16 @@ And introduces:
 
 ```julia
 # AWS, 1000 genomes
-using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); notes="AWS, 1000genomes";
+using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="AWS, 1000genomes";
 
 # AWS, 1000 genomes v2 (w. sep. computational latency)
-using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1_v2.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); notes="AWS, 1000genomes v2";
+using Revise, DSAGAnalysis, CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-c5.xlarge-eu-north-1_v2.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="AWS, 1000genomes v2";
 
 # AWS, 1000 genomes dense equiv. (w. sep. computational latency)
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\pca-1000genomes-dense-equiv-c5.xlarge-eu-north-1.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); df.ncolumns .= 4356480; df.worker_flops .= CodedComputing.worker_flops_from_df(df, density=1); notes="AWS, dense equiv.";
 
 # AWS, latency
-using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\latency-c5.xlarge-eu-north-1.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); notes = "AWS, latency"; notes="AWS, latency";
+using Revise, DSAGAnalysis, CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\AWS traces\\traces\\latency-c5.xlarge-eu-north-1.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes = "AWS, latency"; notes="AWS, latency";
 
 # ex3, 1000 genomes
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\ex3 traces\\pca-1000genomes-ex3.rome16q.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); notes="eX3, 1000genomes";
@@ -146,7 +146,7 @@ using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrame
 using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\pca-1000genomes-dense-equiv-azure.hpc.F2s_v2.csv")); strip_columns!(df); fix_update_latency!(df); remove_initialization_latency!(df); df.ncolumns .= 4356480; df.worker_flops .= CodedComputing.worker_flops_from_df(df, density=1); notes="Azure, dense equiv.";
 
 # Azure, 1000 genomes
-using Revise, CodedComputing; includet("src\\Analysis.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\pca-1000genomes-azure.hpc.F2s_v2.csv")); strip_columns!(df); remove_initialization_latency!(df); fix_update_latency!(df); notes="Azure, 1000genomes";
+using Revise, DSAGAnalysis, CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\pca-1000genomes-azure.hpc.F2s_v2.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="Azure, 1000genomes";
 df = filter(:niterations => (x)->x==100, df);
 
 # Azure, log. reg. rcv1full
