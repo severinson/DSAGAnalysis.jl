@@ -10,7 +10,6 @@ for the 1000 Genomes dataset.
 function df_from_fid(fid, nrows=2504, ncolumns=81271767)
     rv = DataFrame()
     row = Dict{String, Any}()
-    row["mse"] = missing # initialize to missing, it's computed later
 
     # store job parameters
     if "parameters" in keys(fid) && typeof(fid["parameters"]) <: HDF5.Group
@@ -20,6 +19,10 @@ function df_from_fid(fid, nrows=2504, ncolumns=81271767)
             row[key] = value
         end
     end
+    @info "parameters: $row"
+
+    # initialize to missing, it's computed later
+    row["mse"] = missing
 
     # default values for nrows and ncolumns
     # (previous versions of the distributed solver would not store these in the output file)
@@ -28,31 +31,31 @@ function df_from_fid(fid, nrows=2504, ncolumns=81271767)
     end
     if !haskey(row, "ncolumns")
         row["ncolumns"] = ncolumns
-    end    
+    end
 
     # add benchmark data
     niterations = Int(row["niterations"])
     nworkers = Int(row["nworkers"])
+    t_computes = fid["benchmark/t_compute"][:]
+    t_updates = fid["benchmark/t_update"][:]
+    repochs = fid["benchmark/responded"][:, :]
+    latencies = fid["benchmark/latency"][:, :]
+    compute_latencies = fid["benchmark/compute_latency"][:, :]
+    loadbalanced = fid["benchmark/loadbalanced"][:]
     for i in 1:niterations
         row["iteration"] = i
-        row["t_compute"] = fid["benchmark/t_compute"][i]
-        row["t_update"] = fid["benchmark/t_update"][i]
-        for j in 1:nworkers # worker response epochs
-            row["repoch_worker_$j"] = fid["benchmark/responded"][j, i]
+        row["t_compute"] = t_computes[i]
+        row["t_update"] = t_updates[i]
+        for j in 1:nworkers
+            row["repoch_worker_$j"] = repochs[j, i]
         end
-        if "latency" in keys(fid["benchmark"]) # worker latency
-            for j in 1:nworkers
-                row["latency_worker_$j"] = fid["benchmark/latency"][j, i]
-            end
-        end            
-        if "compute_latency" in keys(fid["benchmark"]) # worker compute latency
-            for j in 1:nworkers
-                row["compute_latency_worker_$j"] = fid["benchmark/compute_latency"][j, i]
-            end
+        for j in 1:nworkers
+            row["latency_worker_$j"] = latencies[j, i]
+        end        
+        for j in 1:nworkers
+            row["compute_latency_worker_$j"] = compute_latencies[j, i]
         end
-        if "loadbalanced" in keys(fid["benchmark"])                                 
-            row["loadbalanced"] = fid["benchmark/loadbalanced"][i]
-        end
+        row["loadbalanced"] = loadbalanced[i]
         push!(rv, row, cols=:union)
     end
     rv
@@ -62,6 +65,17 @@ end
 
 Compute the explained variance (here referred to as mse) for PCA. `Xnorm=104444.37027911078` is 
 correct for the 1000 Genomes dataset.
+
+Xnorm used for ICML and NeurIPS:            104444.37027911078 (1000genomes_shuffled_full.h5)
+Xnorm after updating the partitioning code: 104444.37028389802 (1000genomes_shuffled.h5)
+
+1000genomes_shuffled_full.h5:       (2504, 81271767)       104444.37027911078
+1000genomes.h5:                     (2504, 81271767)       104444.37027911078
+1000genomes_shuffled.h5 (sveith)    (2504, 81271767)       104444.37027911078
+1000genomes_shuffled.h5:            (2504, 81271768)       104444.37028389802      (this is the wrong one)
+
+For the ICML and NeurIPS submission, we stated that the size of the genome matrix was 2504 x 81271767,
+but it is actually 2504 x 81271768, i.e., we were missing 1 column. This column was lost when permuting the columns.
 """
 function compute_mse_pca!(mses, iterates, Xs; mseiterations=20, Xnorm=104444.37027911078)
     if iszero(mseiterations)
@@ -81,7 +95,7 @@ function compute_mse_pca!(mses, iterates, Xs; mseiterations=20, Xnorm=104444.370
             end
         end
         mses[i] = (sum(norms) / Xnorm)^2
-        println("Iteration $i finished in $t s")
+        @info "Computed MSE $(mses[i]) for iteration $i in $t seconds"
     end
     GC.gc()
     mses
@@ -89,7 +103,7 @@ end
 
 function compute_mse_pca!(mses, iterates, iterateindices, Xs; Xnorm=104444.37027911078)
     size(iterates, 3) == length(iterateindices) || throw(DimensionMismatch("iterates has dimensions $(size(iterates)), but iterateindices has dimension $(length(iterateindices))"))
-    for k in 1:iterateindices
+    for k in 1:length(iterateindices)
         i = iterateindices[k]
         if !ismissing(mses[i])
             continue
@@ -101,13 +115,14 @@ function compute_mse_pca!(mses, iterates, iterateindices, Xs; Xnorm=104444.37027
             end
         end
         mses[i] = (sum(norms) / Xnorm)^2
-        println("Iteration $i finished in $t s")
+        @info "Computed MSE $(mses[i]) for iteration $i in $t seconds"
     end
     GC.gc()
     mses
 end
 
 function compute_mse_logreg!(mses, iterates, data; mseiterations)
+    @info "Computing log. reg. MSE for $mseiterations iterations"
     if iszero(mseiterations)
         return mses
     end    
@@ -134,6 +149,7 @@ function compute_mse_logreg!(mses, iterates, iterateindices, data)
     @info "Computing log. reg. MSE for iterations $iterateindices"
     Xs, bs, λ = data
     prob = LogRegProblem(Xs, bs, λ)
+    @info "prob: $prob"
     for k in 1:length(iterateindices)
         i = iterateindices[k]
         if !ismissing(mses[i])
@@ -189,7 +205,7 @@ making up the integers of the `i`-th partition.
 """
 function partition(n::Integer, p::Integer, i::Integer)
     0 < n || throw(ArgumentError("n must be positive, but is $n"))
-    0 < p <= n || throw(ArgumentError("p must be in [1, $n], but is $p"))    
+    0 < p <= n || throw(ArgumentError("p must be in [1, $n], but is $p"))
     0 < i <= p || throw(ArgumentError("i must be in [1, $p], but is $i"))
     (div((i-1)*n, p)+1):div(i*n, p)
 end
@@ -199,7 +215,7 @@ end
 Read the sparse matrix stored in dataset with `name` in `filename` and partitions it column-wise 
 into `nblocks` partitions.
 """
-function load_inputmatrix(filename, name::AbstractString="X"; nblocks=Threads.nthreads())
+function load_inputmatrix(filename="/home/albin/.julia/dev/CodedComputing/1000genomes/parsed/1000genomes_shuffled_full.h5", name::AbstractString="X"; nblocks=Threads.nthreads())
     X = H5SparseMatrixCSC(filename, name)
     m, n = size(X)
     [sparse(X[:, partition(n, nblocks, i)]) for i in 1:nblocks]
@@ -249,7 +265,9 @@ function df_from_output_file(filename::AbstractString; prob=nothing, df_filename
         return DataFrame()
     end
     h5open(filename) do fid
+        @info "reading dataframe from disk"
         df = isfile(df_filename) ? DataFrame(CSV.File(df_filename)) : df_from_fid(fid)
+        @info "finished reading dataframe"
         df = df[.!ismissing.(df.iteration), :]
         sort!(df, :iteration)        
         if size(df, 1) == 0
@@ -295,11 +313,15 @@ function aggregate_dataframes(dir::AbstractString; outputdir::AbstractString=dir
     df
 end
 
-function load_logreg_problem(filename="/home/albin/rcv1/rcv1_shuffled.h5"; nblocks=Threads.nthreads(), name="X", labelname="b")
+"""
+
+covertype: "/home/albin/covtype/covtype.h5"
+
+"""
+function load_logreg_problem(filename="/home/albin/higgs/higgs.h5"; nblocks=Threads.nthreads(), name="X", labelname="b")
     h5open(filename) do fid
-        X = H5SparseMatrixCSC(fid, name)
-        m, n = size(X)
-        Xs = [sparse(X[:, partition(n, nblocks, i)]) for i in 1:nblocks]
+        m, n = size(fid[name])
+        Xs = [fid[name][:, partition(n, nblocks, i)] for i in 1:nblocks]
         bs = [fid[labelname][partition(n, nblocks, i)] for i in 1:nblocks]
         return Xs, bs
     end
@@ -376,18 +398,24 @@ end
 
 Read all output files from `dir` and write summary statistics (e.g., iteration time and convergence) to DataFrames.
 """
-function parse_output_files(dir::AbstractString; prefix="output", dfname="df.csv", reparse=false, prob=nothing, mseiterations=20)
+function parse_output_files(dir::AbstractString; prefix="output", dfname="df.csv", reparse=false, prob=nothing, mseiterations=20, onlymse=true)
 
     # process output files
     filenames = glob("$(prefix)*.h5", dir)
-    shuffle!(filenames) # randomize the order to minimize overlap when using multiple concurrent processes
+    # shuffle!(filenames) # randomize the order to minimize overlap when using multiple concurrent processes
     for (i, filename) in enumerate(filenames)
         t = now()
         println("[$i / $(length(filenames)), $(Dates.format(now(), "HH:MM"))] parsing $filename")
         parse_output_file(filename; reparse, prob, mseiterations)
         GC.gc()
     end
-    aggregate_dataframes(dir; prefix, dfname)
+    aggregate_dataframes(dir; prefix, dfname, onlymse)
+end
+
+function parse_output_files(dirs::AbstractVector{<:AbstractString}, args...; kwargs...)
+    for dir in dirs
+        parse_output_files(dir, args...; kwargs...)
+    end
 end
 
 function parse_loop(args...; kwargs...)
