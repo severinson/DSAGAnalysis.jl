@@ -150,7 +150,7 @@ using Revise, DSAGAnalysis, CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\
 df = filter(:niterations => (x)->x==100, df);
 
 # Azure, log. reg. rcv1full
-using Revise, DSAGAnalysis; const m = DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\logreg-rcv1full-azure.hpc.F2s_v2.csv")); DSAGAnalysis.fix_nwaitschedule!(df); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="Azure, rcv1full";
+using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; const m = DSAGAnalysis; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\Azure traces\\logreg-rcv1full-azure.hpc.F2s_v2.csv")); DSAGAnalysis.fix_nwaitschedule!(df); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="Azure, rcv1full";
 
 # eX3, log. reg. rcv1full
 using Revise, DSAGAnalysis; includet("src\\Parsing.jl"); using CSV, DataFrames; df = DataFrame(CSV.File("C:\\Users\\albin\\Dropbox\\PhD\\Eigenvector project\\ex3 traces\\logreg-rcv1full-ex3-rome16q.csv")); DSAGAnalysis.strip_columns!(df); DSAGAnalysis.fix_update_latency!(df); DSAGAnalysis.remove_initialization_latency!(df); DSAGAnalysis.compute_cumulative_time!(df); notes="ex3, rcv1full, zero";
